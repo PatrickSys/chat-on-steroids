@@ -11691,7 +11691,10 @@ async function failRepairAttempt(
       // Navigation is transient; keep the same repair episode and retry after the short navigation cooldown.
       repair.notBefore = Math.max(repair.notBefore, Date.now() + NAVIGATION_RECOVERY_COOLDOWN_MS);
     }
-    if (repair.reason === 'unattributed' && !heldByApproval && !deferred) repair.state = 'done';
+    // Goal/queue pickup attempts were reserved in their durable owner. A known
+    // no-action failure finishes that attempt; the next action belongs to its
+    // persisted deadline/budget. A pre-action authority deferral still spends none.
+    if (!deferred && ((repair.reason === 'unattributed' && !heldByApproval) || repair.reason === 'goal')) repair.state = 'done';
     else {
       repair.state = 'queued';
       repair.claimed = false;

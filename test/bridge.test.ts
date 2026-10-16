@@ -18552,7 +18552,8 @@ describe('the goal loop over the bridge', () => {
     } finally { vi.useRealTimers(); }
   });
 
-  it.each([false, true])('bounds Goal pickup at three reloads, including restored debt (%s)', async restored => {
+  it.each([false, true].flatMap(restored => [false, true].map(failed => ({ restored, failed }))))(
+    'bounds Goal pickup at three attempts (restored $restored, failed action $failed)', async ({ restored, failed }) => {
     vi.useFakeTimers();
     try {
       await pair();
@@ -18611,8 +18612,8 @@ describe('the goal loop over the bridge', () => {
       await vi.advanceTimersByTimeAsync(2 * 60_000 - 1_000);
       expect(await takeRepair()).toBeNull();
 
-      // Two minutes, then five and ten between retries. Each reload is confirmed the way the
-      // extension confirms it, so this measures three completed attempts, not an unclaimed offer.
+      // Two minutes, then five and ten between attempts. A positive report that the page
+      // changed before action must return to this same persisted budget, not refund it.
       const gaps = [1_000, 5 * 60_000, 10 * 60_000];
       for (const [index, gap] of gaps.entries()) {
         await vi.advanceTimersByTimeAsync(gap);
@@ -18627,8 +18628,13 @@ describe('the goal loop over the bridge', () => {
         expect((await request('POST', '/repairs/claim', { body: { token: handout!.token } })).body.allowed).toBe(true);
         expect((await request('GET', '/status')).body.repairs).toEqual([]);
         expect((await request('GET', '/status')).body.repairs).toEqual([]);
-        expect((await request('GET', `/status?repaired=${handout!.token}&repairAction=reloaded`)).status).toBe(200);
-        // No second reload is queued until the next persisted deadline.
+        const receipt = failed
+          ? `/status?repairFailed=${handout!.token}&repairAction=reloaded&why=changed&detail=navigating`
+          : `/status?repaired=${handout!.token}&repairAction=reloaded`;
+        expect((await request('GET', receipt)).status).toBe(200);
+        // A duplicate or late receipt cannot restart the spent attempt either.
+        expect((await request('GET', receipt)).status).toBe(200);
+        // No second action is queued until the next persisted deadline.
         expect(await takeRepair()).toBeNull();
       }
 

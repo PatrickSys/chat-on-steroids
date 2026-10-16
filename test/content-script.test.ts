@@ -10314,7 +10314,7 @@ describe('a stop button that goes missing while the turn is still running', () =
     expect(emitted(live.sent, 'chat_error').map((entry) => entry.event.text)).toContain(
       'No visible progress for ten minutes. The app could not confirm that this turn finished.'
     );
-    expect(emitted(live.sent, 'chat_error').at(-1)!.event.recoverable).toBe(true);
+    expect(emitted(live.sent, 'chat_error').at(-1)!.event.recoverable).toBe(false);
 
     for (let tick = 0; tick < 3; tick++) {
       live.advance(live.hook.STALL_MS + 1);
@@ -10401,6 +10401,16 @@ describe('a stop button that goes missing while the turn is still running', () =
     live!.hook.observe();
     await settle();
     expect(stalls(live!)).toBe(1);
+  });
+
+  it('reports a quiet Pro turn without authorizing a transport-error reload', async () => {
+    await liveReasoningTurn('pro', 'quiet-pro');
+    live!.advance(live!.hook.STALL_MS + 1);
+    live!.hook.observe();
+    await settle();
+    expect(emitted(live!.sent, 'chat_error').filter(entry => entry.event.text === stallText)
+      .map(entry => entry.event.recoverable)).toEqual([false]);
+    expect(emitted(live!.sent, 'turn_end')).toEqual([]);
   });
 
   /**
@@ -11020,8 +11030,9 @@ describe('a stop button that goes missing while the turn is still running', () =
     expect(errors.map((error) => error.text)).toContain(
       'No visible progress for ten minutes. The app could not confirm that this turn finished.'
     );
-    // The turn it names, so the app can place it: recovery authority stays where it was.
-    expect(errors.at(-1)).toMatchObject({ turnId: opened, recoverable: true });
+    // The named diagnostic must not grant a transport-error reload. Silence recovery
+    // retains its separate local-work proof, model-specific clock and busy deferral.
+    expect(errors.at(-1)).toMatchObject({ turnId: opened, recoverable: false });
     expect(live.sent.some((message) => message.type === 'reload_owned_chat'),
       'the page took recovery into its own hands').toBe(false);
     // Said once, not once per observation: a stalled turn is observed every two seconds.

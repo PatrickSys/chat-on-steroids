@@ -20,7 +20,7 @@ All browser-side repairs go through one function, `queueBrowserRecovery` in `src
 
 | Path | Starts when | Clock | Budget | Owner |
 | --- | --- | --- | --- | --- |
-| Page stall notice | A turn shows no visible progress. | 10 min (`STALL_MS` in `extension/content.js`), not while a deliberate thinking turn is live. | Once per turn: records `turn_end` `stalled` and a recoverable `chat_error`, which the app may answer with `assistant-error`. | `extension/content.js` |
+| Page stall notice | A turn shows no visible progress. | 10 min (`STALL_MS` in `extension/content.js`), not while a deliberate thinking turn is live. | Once per turn: records a diagnostic `chat_error` (`recoverable: false`); after generation disappears an unconfirmed turn may end `stalled`. The notice grants no error reload. The app's silence owner retains its model-specific clock and local-work gates. | `extension/content.js` |
 | Worker wake | A sleeping worker gets a message from its prime. | The browser has 3 min to type the wake (`REVIVAL_DEADLINE_MS`); the woken worker then has 3 more min plus its silence window for a first tool call (`REVIVAL_ACTIVITY_MS`). | One wake attempt per deadline; expiry does not authorize another send. At most 16 wakes per browser reply. | `bridge.ts`, `agents.ts` |
 | Automatic Continue | A silence or error repair is confirmed and the turn has no final answer. | Filed at confirmation; delivered as a queued message. | One per repair. It is held while the chat's own tool calls still run, and up to 3 min (`UNKNOWN_CALL_HOLD_MS`) for calls of no known chat. | `bridge.ts`, `session/input.ts` |
 

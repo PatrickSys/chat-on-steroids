@@ -3312,7 +3312,10 @@
             'No visible progress for ten minutes. The app could not confirm that this turn finished.'
           ),
           turnId,
-          recoverable: true
+          // Silence is not a provider transport failure. The app owns its model-specific
+          // silence window, exact local-work proof and busy deferral; this notice must not
+          // bypass those gates by earning an immediate assistant-error reload.
+          recoverable: false
         });
       }
     }

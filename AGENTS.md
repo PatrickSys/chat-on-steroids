@@ -3366,6 +3366,9 @@ Its switch controls ordinary chats; enabled Goal/Loop also uses the shared recov
 and workers retain their separate lifecycle. Silence intervention requires an exactly attributed
 local MCP call in the current source turn, including at refresh and restored-ticket admission.
 Observing a website chat, native searches and earlier-turn calls do not grant that permission.
+The page's ten-minute no-visible-progress notice is diagnostic (`recoverable: false`),
+not a transport failure. It grants no assistant-error reload; this shared silence owner
+still decides whether and when intervention is earned, including for a live Pro answer.
 An eligible turn's actual-work silence earns one initial reload:
 two minutes normally/unknown, ten for proven Pro, twenty for non-Pro Extra high/Max/Ultra;
 Thinking failed shortens Pro to five and Extra high/Max/Ultra to two.

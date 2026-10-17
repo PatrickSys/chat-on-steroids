@@ -1242,8 +1242,12 @@ export function clearGoalSwitch(conversationId: string): void {
   invalidateGoalControlWrites(pendingGoalSwitches, [conversationId]);
   const row = goalSwitches.get(conversationId);
   if (!row) return;
-  goalSwitches.set(conversationId, { enabled: false, mode: 'goal', at: Date.now(), inherit: true,
-    loopRecoveryRevision: row.loopRecoveryRevision ?? UNKNOWN_LOOP_RECOVERY_ID });
+  if (!row.inherit && (!row.loopRecoveryRevision || row.loopRecoveryRevision === UNKNOWN_LOOP_RECOVERY_ID)) {
+    goalSwitches.delete(conversationId);
+  } else {
+    goalSwitches.set(conversationId, { enabled: false, mode: 'goal', at: Date.now(), inherit: true,
+      loopRecoveryRevision: row.loopRecoveryRevision ?? UNKNOWN_LOOP_RECOVERY_ID });
+  }
   persistGoalSwitches();
 }
 

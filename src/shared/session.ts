@@ -474,7 +474,7 @@ export type SessionEvent =
    * event written before this model existed, or by a page whose commentary had no readable
    * identity, is still a plain standalone caption.
    */
-  | (BaseEvent & { kind: 'progress'; message: StoredText; progressId?: string; origin?: number; finishControl?: { state: 'released' | 'notified' | 'decision'; conversationId: string; revision?: string; inputRevision?: string; workSeq?: number } })
+  | (BaseEvent & { kind: 'progress'; message: StoredText; progressId?: string; origin?: number; finishControl?: { state: 'released' | 'notified' | 'decision' | 'redraft'; conversationId: string; revision?: string; inputRevision?: string; workSeq?: number } })
   /**
    * Visible ChatGPT-native tool activity that never passed through this MCP server.
    *
@@ -770,6 +770,10 @@ export interface SessionSummary {
     decisionSeq: number;
     decisionInputRevision: string | null;
     decisionAt?: number;
+    /** When this held turn's one no-tool Loop redraft was spent; cleared by a real tool call. */
+    noToolRedraftAt?: number;
+    /** The turn whose finish or completion spent that redraft; a later turn finds it already spent. */
+    noToolRedraftTurn?: string;
   } | null;
   /** Agents seen in this session, prime first. Empty when no swarm ran. */
   agents: string[];

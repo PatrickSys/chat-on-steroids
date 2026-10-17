@@ -1130,9 +1130,12 @@ function applyToSummary(summary: SessionSummary, event: SessionEvent): void {
   }
   if (event.kind === 'turn_start') {
     summary.activeTurnId = event.turnId ?? `seq-${event.seq}`;
+    const prior = summary.finishTurn?.conversationId === summary.conversationId ? summary.finishTurn : null;
+    const spent = prior?.noToolRedraftAt !== undefined && prior.noToolRedraftTurn ? { noToolRedraftAt: prior.noToolRedraftAt, noToolRedraftTurn: prior.noToolRedraftTurn } : null;
     if (summary.finishTurn?.turnId !== summary.activeTurnId) summary.finishTurn = {
       turnId: summary.activeTurnId, conversationId: summary.conversationId, startedAt: event.time,
-      notified: false, released: false, decisionRevision: null, workSeq: 0, decisionSeq: 0, decisionInputRevision: null
+      notified: false, released: false, decisionRevision: null, workSeq: 0, decisionSeq: 0, decisionInputRevision: null,
+      ...(spent ?? {})
     };
   }
   if (event.kind === 'progress' && event.source === 'app' && event.turnId && summary.finishTurn?.turnId === event.turnId) {
@@ -1153,6 +1156,14 @@ function applyToSummary(summary: SessionSummary, event: SessionEvent): void {
     }
     if (event.finishControl) finish.conversationId = event.finishControl.conversationId;
     if (event.finishControl?.state === 'released') finish.released = true;
+    if (event.finishControl?.state === 'redraft') { finish.noToolRedraftAt = event.time; finish.noToolRedraftTurn = event.turnId; }
+  }
+  // The no-tool Loop redraft stays spent until a real, exactly attributed tool call (not the finish tool itself).
+  if (event.kind === 'tool_call' && event.source === 'mcp' && summary.finishTurn?.noToolRedraftAt !== undefined &&
+      event.turnId === summary.finishTurn.turnId && event.call.attribution === 'request_id' &&
+      event.call.conversationId === summary.conversationId && !['keep_astra_on_forever', 'session_finish'].includes(event.call.tool)) {
+    const { noToolRedraftAt: _at, noToolRedraftTurn: _turn, ...rest } = summary.finishTurn;
+    summary.finishTurn = rest;
   }
   noteFinishWork(summary, event);
   if (event.kind === 'turn_end' && (!event.turnId || summary.activeTurnId === event.turnId)) summary.activeTurnId = null;
@@ -2540,6 +2551,8 @@ function normalizeSummary(id: string, raw: string): MetaCheckpoint | null {
         !Number.isSafeInteger(finish.workSeq) || finish.workSeq < 0 || !Number.isSafeInteger(finish.decisionSeq) || finish.decisionSeq < 0 ||
         !(finish.decisionInputRevision === null || (typeof finish.decisionInputRevision === 'string' && /^[a-f0-9]{64}$/.test(finish.decisionInputRevision))) ||
         !(finish.conversationId === null || typeof finish.conversationId === 'string') ||
+        !(finish.noToolRedraftAt === undefined || Number.isFinite(finish.noToolRedraftAt)) ||
+        !(finish.noToolRedraftTurn === undefined || typeof finish.noToolRedraftTurn === 'string') ||
         !(finish.decisionRevision === null || /^[a-f0-9]{64}$/.test(finish.decisionRevision)))) delete publicSummary.finishTurn;
 
     // A meta.json written before agents, app-opened chats or the session lineage existed

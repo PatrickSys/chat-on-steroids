@@ -194,6 +194,17 @@ describe('session finish turn identity', () => {
     expect(notify).not.toHaveBeenCalled();
     expect(hooks.enqueue).toHaveBeenCalledWith(expect.objectContaining({ mode: 'auto' }), { turnId: 'turn-one', periodic: false, mode });
   });
+  it('reports an exhausted no-tool Loop redraft as a stall, not as a normal notice, and queues nothing', async () => {
+    hooks.followup.mockRejectedValueOnce(new TaskRequestError('loop_stalled', false));
+    await setGoalSwitchNow(hooks.caller.conversationId, 'loop', true);
+    await announceSessionFinish(sessionId, 'No tools were used');
+    const rows = (await readRecentEvents(sessionId, 50, { kinds: ['progress'] }))
+      .flatMap(event => event.kind === 'progress' ? [event.message.text] : []);
+    expect(rows.some(text => text.startsWith('Loop stalled.') && text.includes('No MCP tool call was recorded'))).toBe(true);
+    expect(rows.some(text => text.includes('An automatic Goal instruction is queued'))).toBe(false);
+    expect(hooks.followup).toHaveBeenCalledOnce();
+    expect(hooks.enqueue).not.toHaveBeenCalled();
+  });
   it('releases the exact finish hold when Goal completes without fabricating a final or a queued instruction', async () => {
     hooks.hasInput = false;
     hooks.followup.mockResolvedValueOnce(null);

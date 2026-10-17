@@ -11,6 +11,7 @@ import { draftFastFollowup, conversationMessages, automaticFinishEnabled, goalDr
 import { hasEligibleToolInput, finishNeedsBrowserInput, onInputChange, listInputs, enqueueInput } from './input.js';
 
 import { logWarn } from '../logger.js';
+import { goalErrorMessage } from '../../shared/goal-errors.js';
 import { retryTaskRequest } from '../task-request.js';
 
 let notify: ((title: string, body: string, sessionId: string, turnId: string) => boolean | void) | null = null;
@@ -180,7 +181,9 @@ async function prepareNotice(sessionId: string, summary: string, userRequested =
         result = 'Goal found no remaining requested work. The finish hold was released; ChatGPT may complete its answer.';
       }
     } catch (error) {
-      result = `${notification} Goal follow-up was not available: ${(error as Error).message}. ${REMAINING}`;
+      const detail = (error as Error).message;
+      result = detail === 'loop_stalled' ? `Loop stalled. ${goalErrorMessage('loop_mcp_call_missing')} ${REMAINING}`
+        : `${notification} Goal follow-up was not available: ${detail}. ${REMAINING}`;
     } finally { stopInput(); stopSession(); stopGoal(); }
     await recordProgress(sessionId, progressId, result, anchor, turnId);
     return result;

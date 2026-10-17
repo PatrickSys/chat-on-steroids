@@ -3674,6 +3674,10 @@ decision is generated from silence or a failed response.
 **User decision, 2026-09-13:** every automatic Loop continuation requires at least one recorded,
 exactly attributed local MCP call in the source turn, including ordinary completed finals and
 finish follow-ups. Native page tools, another turn's calls and unattributed work do not qualify.
+**Exception:** one no-tool recovery is allowed for the exact held turn or the latest exact completed
+native final. It is recorded as `finishControl.state='redraft'` (`finishTurn.noToolRedraftAt`,
+`noToolRedraftTurn`) and stays spent across restarts until exact attributed MCP work or Loop Off/On
+clears it. A further no-tool turn stalls visibly.
 The proof is existence in the exact source turn, not a requirement that its call be the latest
 stored row. Late attribution backfill without a turn must not erase earlier exact proof.
 Explicit user activation may proceed without that proof after the existing idle gate. Only the

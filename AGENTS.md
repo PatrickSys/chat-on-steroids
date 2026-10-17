@@ -3664,9 +3664,14 @@ includes delivery availability and preference in its existing repaint key.
 After-turn Goal and Loop use the existing Goal reply ledger for real finals. Unfinished responses
 use shared Continue recovery (§14), requiring a local MCP call in the exact source turn. No automatic Goal/Loop
 decision is generated from silence or a failed response.
-**User decision, 2026-09-13:** every automatic Loop continuation requires at least one recorded,
-exactly attributed local MCP call in the source turn, including ordinary completed finals and
-finish follow-ups. Native page tools, another turn's calls and unattributed work do not qualify.
+**User decision, 2026-09-13, extended 2026-10-17:** automatic Loop continuations require a
+recorded, exactly attributed local MCP call in the source turn. One no-tool recovery is allowed
+for the exact held turn or an exact completed native final. Record it as
+`finishControl.state='redraft'` with `finishTurn.noToolRedraftAt` and `noToolRedraftTurn`; it
+survives restarts and later no-tool turns until exact attributed MCP work clears it or Loop is
+switched Off and On. A further no-tool turn stalls visibly. Native page tools, calls from another
+turn and unattributed work do not qualify. For native finals, require the latest exact completed
+turn boundary; interim prose, native-busy requests, and older or foreign turn ends cannot spend it.
 The proof is existence in the exact source turn, not a requirement that its call be the latest
 stored row. Late attribution backfill without a turn must not erase earlier exact proof.
 Explicit user activation may proceed without that proof after the existing idle gate. Only the

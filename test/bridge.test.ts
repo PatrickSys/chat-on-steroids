@@ -12980,20 +12980,46 @@ describe('unattributed activity recovery', () => {
     } finally { resetGoalStateForTests(); await setSecret('openRouterApiKey', ''); await saveConfig(previous); vi.useRealTimers(); }
   });
 
-  it('blocks automatic Loop without source MCP but allows deliberate idle activation', async () => {
+  it('gives a completed native Loop turn without source MCP one recovery through the real draft, activity and ack gates, then blocks the next; deliberate idle activation still works', async () => {
     const chat = 'c9494949-1111-2222-3333-444444444444';
     const goal = await import('../src/main/goal.js');
+    const { readRecentEvents } = await import('../src/main/session/store.js');
     const previous = getConfig();
-    await saveConfig({ ...previous, goal: { ...previous.goal, enabled: true, mode: 'loop' } });
+    await saveConfig({ ...previous, goal: { ...previous.goal, enabled: true, mode: 'loop', backend: 'api', loopBackend: 'api', model: 'deepseek/deepseek-v4-flash' } });
     await setSecret('openRouterApiKey', 'sk-or-loop-proof-test');
+    const realFetch = globalThis.fetch;
+    const helper = vi.fn(async () => Response.json({ choices: [{ message: { content: JSON.stringify({ action: 'continue', reply: 'run the tests and fix what fails' }) } }] }));
+    globalThis.fetch = helper as never;
+    const noToolTurn = (turn: string) => events(chat, [openTurn(turn), { kind: 'assistant_message', turnId: turn, messageId: `${turn}-final`,
+      time: Date.now(), text: 'I cannot access the MCP tools.', final: true, state: 'final', activeNow: true, goalEligible: true }, endTurn(turn, 'completed')]);
+    const activity = async () => (await request('GET', `/activity?conversationId=${chat}&goalClient=page`)).body.goal;
     try {
       await pair();
       await events(chat, [{ kind: 'model_selection', model: 'GPT-5.6 Sol', reasoningEffort: 'high', time: Date.now() },
-        openTurn('loop-without-mcp'), { kind: 'assistant_message', turnId: 'loop-without-mcp', messageId: 'loop-no-tools-final',
-          time: Date.now(), text: 'I cannot access the MCP tools.', final: true, state: 'final', activeNow: true, goalEligible: true },
-        endTurn('loop-without-mcp', 'completed')]);
+        { kind: 'user_message', time: Date.now(), text: 'diagnose the test suite', messageId: 'q-loop-without-mcp' }]);
+      await noToolTurn('loop-without-mcp');
+      expect(goalPendingReplyFor(chat)).toMatchObject({ turnId: 'loop-without-mcp' });
+      const started = await request('POST', '/goal/draft', { body: { conversationId: chat, turnId: 'loop-without-mcp', clientId: 'page' } });
+      expect(started.status).toBe(200);
+      await vi.waitFor(async () => expect((await activity()).draft).toMatchObject({ stage: 'ready', turnId: 'loop-without-mcp' }), { timeout: 10_000 });
+      expect(helper).toHaveBeenCalledTimes(1);
+
+      // The durable budget is spent now. Every later gate must still honour this same reply, exactly once.
+      const spent = await activity();
+      expect(spent.pending).toMatchObject({ turnId: 'loop-without-mcp' });
+      expect(spent.draft).toMatchObject({ stage: 'ready', turnId: 'loop-without-mcp', token: expect.any(String) });
+      const again = await request('POST', '/goal/draft', { body: { conversationId: chat, turnId: 'loop-without-mcp', clientId: 'page' } });
+      expect(again.status).toBe(200);
+      const busy = await request('POST', '/goal/draft', { body: { conversationId: chat, turnId: 'loop-without-mcp', clientId: 'page', nativeBusy: true } });
+      expect(busy.status).toBe(200);
+      expect(helper).toHaveBeenCalledTimes(1);
+      const ack = await request('POST', '/goal/ack', { body: { conversationId: chat, token: spent.draft.token, clientId: 'page' } });
+      expect(ack.body.acknowledged).toBe(true);
       expect(goalPendingReplyFor(chat)).toBeNull();
-      const refused = await request('POST', '/goal/draft', { body: { conversationId: chat, turnId: 'loop-without-mcp' } });
+
+      await noToolTurn('loop-without-mcp-2');
+      expect(goalPendingReplyFor(chat)).toBeNull();
+      const refused = await request('POST', '/goal/draft', { body: { conversationId: chat, turnId: 'loop-without-mcp-2' } });
       expect(refused.status).toBe(409);
       expect(refused.body).toMatchObject({ error: 'loop_mcp_call_missing', retryable: false });
       expect(refused.body.message).toContain('No MCP tool call was recorded in the last response');
@@ -13001,16 +13027,67 @@ describe('unattributed activity recovery', () => {
       expect(refused.body.message).toContain('the tool connection may have been lost');
       expect(refused.body.message).toContain('Answer it');
       expect(refused.body.message).toContain('Loop remains enabled');
-      expect(goal.goalViewFor(chat)).toBeNull();
+      const sessionId = goal.snapshotGoalReplies().replies.find(row => row.conversationId === chat)!.sessionId;
+      const stalled = (await readRecentEvents(sessionId, 80)).flatMap((event: any) =>
+        event.kind === 'progress' && event.progressId === 'loop-stalled:loop-without-mcp-2' ? [event.message.text as string] : []);
+      expect(stalled).toEqual([expect.stringContaining('Stalled: this Loop turn made no tool call.')]);
+      expect(helper).toHaveBeenCalledTimes(1);
+
       await request('POST', '/settings', { body: { conversationId: chat, loop: false } });
       await request('POST', '/settings', { body: { conversationId: chat, loop: true } });
-      expect(goalPendingReplyFor(chat)).toMatchObject({ turnId: 'loop-without-mcp' });
+      expect(goalPendingReplyFor(chat)).toMatchObject({ turnId: 'loop-without-mcp-2' });
       expect(goal.snapshotGoalReplies().replies.find(row => row.conversationId === chat)).toMatchObject({ explicitActivation: true });
-      const allowed = await request('POST', '/goal/draft', { body: { conversationId: chat, turnId: 'loop-without-mcp', terminalRequired: true } });
+      const allowed = await request('POST', '/goal/draft', { body: { conversationId: chat, turnId: 'loop-without-mcp-2', terminalRequired: true } });
       expect(`${allowed.status} ${JSON.stringify(allowed.body)}`).toMatch(/^200 /);
-    } finally { resetGoalStateForTests(); await setSecret('openRouterApiKey', ''); await saveConfig(previous); }
+    } finally { globalThis.fetch = realFetch; resetGoalStateForTests(); await setSecret('openRouterApiKey', ''); await saveConfig(previous); }
   });
 
+  it.each([{ name: 'fresh active redraft', olderCompletion: false, sameStableMessageId: false },
+    { name: 'redraft after older completed turn', olderCompletion: true, sameStableMessageId: false },
+    { name: 'stable message id reused through completion', olderCompletion: false, sameStableMessageId: true }])(
+    'waits for the exact Loop redraft turn to finish before spending its no-tool completion authority ($name)', async ({ olderCompletion, sameStableMessageId }) => {
+    const chat = olderCompletion ? 'c9494949-1111-2222-3333-444444444446' : sameStableMessageId ? 'c9494949-1111-2222-3333-444444444447' : 'c9494949-1111-2222-3333-444444444445';
+    const goal = await import('../src/main/goal.js');
+    const { readRecentEvents } = await import('../src/main/session/store.js');
+    const previous = getConfig();
+    await saveConfig({ ...previous, goal: { ...previous.goal, enabled: true, mode: 'loop', backend: 'api', loopBackend: 'api', model: 'deepseek/deepseek-v4-flash' } });
+    await setSecret('openRouterApiKey', 'sk-or-loop-proof-test');
+    const realFetch = globalThis.fetch;
+    const helper = vi.fn(async () => Response.json({ choices: [{ message: { content: JSON.stringify({ action: 'continue', reply: 'run the tests and fix what fails' }) } }] }));
+    globalThis.fetch = helper as never;
+    const stalledRows = async (sessionId: string, turnId: string) => (await readRecentEvents(sessionId, 80)).filter(event =>
+      event.kind === 'progress' && event.progressId === `loop-stalled:${turnId}`);
+    try {
+      await pair();
+      await request('POST', '/settings', { body: { conversationId: chat, loop: true } });
+      await events(chat, [{ kind: 'model_selection', model: 'GPT-5.6 Sol', reasoningEffort: 'high', time: Date.now() },
+        { kind: 'user_message', time: Date.now(), text: 'diagnose the test suite', messageId: 'q-loop-redraft' }]);
+      await events(chat, [openTurn('loop-source'), { kind: 'assistant_message', turnId: 'loop-source', messageId: 'loop-source-final',
+        time: Date.now(), text: 'I cannot access the MCP tools.', final: true, state: 'final', activeNow: true, goalEligible: true }, endTurn('loop-source', 'completed')]);
+      expect(goal.goalPendingReplyFor(chat)).toMatchObject({ turnId: 'loop-source' });
+      const recovery = await request('POST', '/goal/draft', { body: { conversationId: chat, turnId: 'loop-source', clientId: 'page' } });
+      expect(recovery.status).toBe(200);
+      await vi.waitFor(async () => expect((await request('GET', `/activity?conversationId=${chat}&goalClient=page`)).body.goal.draft)
+        .toMatchObject({ stage: 'ready', turnId: 'loop-source' }), { timeout: 10_000 });
+      const draft = (await request('GET', `/activity?conversationId=${chat}&goalClient=page`)).body.goal.draft;
+      const sessionId = goal.snapshotGoalReplies().replies.find(row => row.conversationId === chat)!.sessionId;
+      await events(chat, [{ kind: 'user_message', time: Date.now(), text: draft.reply, messageId: 'q-loop-redraft-reply' },
+        ...(olderCompletion ? [endTurn('older-completed-turn', 'completed')] : []), openTurn('loop-redraft-turn'),
+        { kind: 'assistant_message', turnId: 'loop-redraft-turn', messageId: sameStableMessageId ? 'loop-redraft-stable' : 'loop-redraft-interim', providerMessageId: sameStableMessageId ? 'provider-loop-redraft-stable' : 'provider-loop-redraft-interim',
+          time: Date.now(), text: 'I am checking the tests.', final: true, state: 'final', activeNow: true, goalEligible: true }]);
+
+      const interim = await request('POST', '/goal/draft', { body: { conversationId: chat, turnId: 'loop-redraft-turn', clientId: 'page', nativeBusy: true } });
+      expect(interim.status).toBe(409);
+      expect(interim.body.error).toBe('goal_final_not_confirmed');
+      expect(await stalledRows(sessionId, 'loop-redraft-turn')).toHaveLength(0);
+      expect(helper).toHaveBeenCalledTimes(1);
+
+      await events(chat, [{ kind: 'assistant_message', turnId: 'loop-redraft-turn', messageId: sameStableMessageId ? 'loop-redraft-stable' : 'loop-redraft-final', providerMessageId: sameStableMessageId ? 'provider-loop-redraft-stable' : undefined,
+        time: Date.now(), text: 'I cannot use the MCP tools.', final: true, state: 'final', activeNow: true, goalEligible: true }, endTurn('loop-redraft-turn', 'completed')]);
+      expect(await stalledRows(sessionId, 'loop-redraft-turn')).toHaveLength(1);
+      expect(helper).toHaveBeenCalledTimes(1);
+    } finally { globalThis.fetch = realFetch; resetGoalStateForTests(); await setSecret('openRouterApiKey', ''); await saveConfig(previous); }
+  });
   it('leaves a silent plain chat where it fell when tab recovery is off', async () => {
     const previous = getConfig();
     await saveConfig({

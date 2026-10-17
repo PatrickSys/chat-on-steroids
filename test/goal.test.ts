@@ -2687,7 +2687,7 @@ describe('the loop that never stops', () => {
     }
   });
 
-  it('uses one helper follow-up for a held Loop turn, then stalls after another reply without a recorded local tool call', async () => {
+  it('uses one follow-up while the finish tool holds a Loop turn, then stalls after another reply without a recorded local tool call', async () => {
     const conversationId = 'c-loop-no-mcp-stalled';
     const sessionId = await heldNoToolTurn(conversationId);
     const fetch = vi.fn(async () => decision('continue', 'run tests and fix'));

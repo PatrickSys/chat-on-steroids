@@ -1732,7 +1732,10 @@ restored legacy inputs without one represent the old Loop policy and cannot be d
 
 Finish decision generation deduplicates by actual recorded work/input revision, not a new
 request timestamp or repeated hold call. User input, changed settings, turn release, block or
-replacement invalidates the old attempt. Progress uses the existing mutable timeline row;
+replacement invalidates the old attempt. The one Loop recovery after a reply without a
+recorded local tool call uses a persisted unique Loop activation ID. Missing or evicted per-chat
+switch state keeps that recovery spent until Loop is explicitly turned Off and On in that chat;
+delivery-setting changes preserve the ID. Progress uses the existing mutable timeline row;
 notifications are scoped to that exact turn and may be suppressed when the app is open.
 No periodic generated-input daemon is part of this design; old periodic rows are retired.
 

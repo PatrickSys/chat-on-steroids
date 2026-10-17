@@ -2561,7 +2561,7 @@ function normalizeSummary(id: string, raw: string): MetaCheckpoint | null {
         !(finish.conversationId === null || typeof finish.conversationId === 'string') ||
         !(finish.noToolRedraftAt === undefined || Number.isFinite(finish.noToolRedraftAt)) ||
         !(finish.noToolRedraftTurn === undefined || typeof finish.noToolRedraftTurn === 'string') ||
-        !(finish.noToolRedraftRevision === undefined || (Number.isSafeInteger(finish.noToolRedraftRevision) && finish.noToolRedraftRevision >= 0)) ||
+        !(finish.noToolRedraftRevision === undefined || (typeof finish.noToolRedraftRevision === 'string' && /^[0-9a-f-]{36}$/i.test(finish.noToolRedraftRevision)) || (Number.isSafeInteger(finish.noToolRedraftRevision) && Number(finish.noToolRedraftRevision) >= 0)) ||
         !(finish.decisionRevision === null || /^[a-f0-9]{64}$/.test(finish.decisionRevision)))) delete publicSummary.finishTurn;
 
     // A meta.json written before agents, app-opened chats or the session lineage existed

@@ -2934,6 +2934,47 @@ describe('the loop that never stops', () => {
     } finally { now.mockRestore(); }
   });
 
+  it('keeps an evicted spent recovery blocked until a fresh Loop activation', async () => {
+    const conversationId = 'c-native-loop-evicted-recovery';
+    const sessionId = await heldNoToolTurn(conversationId, 'turn-evicted-recovery', false);
+    const fetch = vi.fn(async () => decision('continue', 'run the tests and fix what fails'));
+    globalThis.fetch = fetch as never;
+    const now = vi.spyOn(Date, 'now').mockReturnValue(2_000_000_000_000);
+    try {
+      await goal.setGoalSwitchNow(conversationId, 'loop', false);
+      await goal.setGoalSwitchNow(conversationId, 'loop', true);
+      expect(await goal.draftFastFollowup(sessionId)).toBe('run the tests and fix what fails');
+      const snapshot = goal.snapshotGoalSwitches();
+      const laterRows = Array.from({ length: 400 }, (_, index) => ({ conversationId: `c-evict-${index}`, enabled: false, mode: 'goal' as const, at: Date.now(), inherit: true as const }));
+      goal.restoreGoalSwitches({ ...snapshot, switches: [...snapshot.switches, ...laterRows] });
+      expect(goal.goalSwitchFor(conversationId).own).toBe(false);
+      await expect(goal.draftFastFollowup(sessionId)).rejects.toThrow('loop_stalled');
+      expect(fetch).toHaveBeenCalledTimes(1);
+      await goal.setGoalSwitchNow(conversationId, 'loop', false);
+      await goal.setGoalSwitchNow(conversationId, 'loop', true);
+      expect(await goal.draftFastFollowup(sessionId)).toBe('run the tests and fix what fails');
+      await expect(goal.draftFastFollowup(sessionId)).rejects.toThrow('loop_stalled');
+      expect(fetch).toHaveBeenCalledTimes(2);
+    } finally { now.mockRestore(); }
+  });
+
+  it('keeps a legacy spend blocked across delivery changes and re-arms after chat Loop Off and On', async () => {
+    const conversationId = 'c-native-loop-legacy-spend';
+    const sessionId = await heldNoToolTurn(conversationId, 'turn-legacy-spend');
+    await goal.setGoalSwitchNow(conversationId, 'loop', true);
+    const { recordProgress } = await import('../src/main/session/recorder.js');
+    await recordProgress(sessionId, 'legacy-redraft', 'legacy recovery', undefined, 'turn-legacy-spend', { state: 'redraft', conversationId });
+    const fetch = vi.fn(async () => decision('continue', 'run the tests and fix what fails'));
+    globalThis.fetch = fetch as never;
+    await goal.setGoalSwitchNow(conversationId, 'loop', true, true);
+    await expect(goal.draftFastFollowup(sessionId)).rejects.toThrow('loop_stalled');
+    expect(fetch).not.toHaveBeenCalled();
+    await goal.setGoalSwitchNow(conversationId, 'loop', false);
+    await goal.setGoalSwitchNow(conversationId, 'loop', true);
+    expect(await goal.draftFastFollowup(sessionId)).toBe('run the tests and fix what fails');
+    await expect(goal.draftFastFollowup(sessionId)).rejects.toThrow('loop_stalled');
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
   it('re-arms one spent recovery after master Loop Off and On', async () => {
     const conversationId = 'c-native-loop-master-reset';
     const sessionId = await heldNoToolTurn(conversationId, 'turn-master-reset', true);
@@ -2941,7 +2982,7 @@ describe('the loop that never stops', () => {
     globalThis.fetch = fetch as never;
     expect(goal.goalSwitchFor(conversationId)).toMatchObject({ own: false, enabled: true, mode: 'loop' });
     expect(await goal.draftFastFollowup(sessionId)).toBe('run the tests and fix what fails');
-    expect((await getSession(sessionId))?.finishTurn?.noToolRedraftRevision).toBe(0);
+    expect((await getSession(sessionId))?.finishTurn?.noToolRedraftRevision).toEqual(expect.any(String));
     expect(goal.goalSwitchFor(conversationId)).toMatchObject({ own: false, enabled: true, mode: 'loop' });
 
     goal.clearGoalSwitch(conversationId);

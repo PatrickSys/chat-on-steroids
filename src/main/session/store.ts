@@ -1158,7 +1158,7 @@ function applyToSummary(summary: SessionSummary, event: SessionEvent): void {
     if (event.finishControl?.state === 'released') finish.released = true;
     if (event.finishControl?.state === 'redraft') { finish.noToolRedraftAt = event.time; finish.noToolRedraftTurn = event.turnId; }
   }
-  // The no-tool Loop redraft stays spent until a real, exactly attributed tool call (not the finish tool itself).
+  // The no-tool Loop recovery stays spent until an exactly attributed tool call (not the finish tool itself).
   if (event.kind === 'tool_call' && event.source === 'mcp' && summary.finishTurn?.noToolRedraftAt !== undefined &&
       event.turnId === summary.finishTurn.turnId && event.call.attribution === 'request_id' &&
       event.call.conversationId === summary.conversationId && !['keep_astra_on_forever', 'session_finish'].includes(event.call.tool)) {

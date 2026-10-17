@@ -11,7 +11,6 @@ import { draftFastFollowup, conversationMessages, automaticFinishEnabled, goalDr
 import { hasEligibleToolInput, finishNeedsBrowserInput, onInputChange, listInputs, enqueueInput } from './input.js';
 
 import { logWarn } from '../logger.js';
-import { goalErrorMessage } from '../../shared/goal-errors.js';
 import { retryTaskRequest } from '../task-request.js';
 
 let notify: ((title: string, body: string, sessionId: string, turnId: string) => boolean | void) | null = null;
@@ -182,7 +181,7 @@ async function prepareNotice(sessionId: string, summary: string, userRequested =
       }
     } catch (error) {
       const detail = (error as Error).message;
-      result = detail === 'loop_stalled' ? `Loop stalled. ${goalErrorMessage('loop_mcp_call_missing')} ${REMAINING}`
+      result = detail === 'loop_stalled' ? `Loop stalled. ChatGPT did not use any tools in its last reply. Answer any question or check the tool connection. Automatic continuation is paused; Loop remains enabled. ${REMAINING}`
         : `${notification} Goal follow-up was not available: ${detail}. ${REMAINING}`;
     } finally { stopInput(); stopSession(); stopGoal(); }
     await recordProgress(sessionId, progressId, result, anchor, turnId);

@@ -12451,10 +12451,10 @@ describe('unattributed activity recovery', () => {
     } finally { resetGoalStateForTests(); await setSecret('openRouterApiKey', ''); await saveConfig(previous); }
   });
 
-  for (const afterTurn of [false, true]) for (const proof of ['missing', 'exact', 'older', 'new turn']) it(`requires ${proof} canonical Pro final proof without any recent tool call (after-turn ${afterTurn})`, async () => {
+  for (const finishTool of [false, true]) for (const afterTurn of [false, true]) for (const proof of ['missing', 'exact', 'older', 'new turn']) it(`handles ${proof} Pro reply with finish tool ${finishTool} and after-turn ${afterTurn}`, async () => {
     const conversationId = randomUUID();
     const previous = getConfig();
-    await saveConfig({ ...previous, goal: { ...previous.goal, enabled: true, mode: 'loop' } });
+    await saveConfig({ ...previous, ui: { ...previous.ui, finishTool }, goal: { ...previous.goal, enabled: true, mode: 'loop' } });
     await setSecret('openRouterApiKey', 'sk-or-pro-final');
     resetGoalStateForTests();
     try {
@@ -12466,9 +12466,8 @@ describe('unattributed activity recovery', () => {
       await events(conversationId, [endTurn('pro-final-' + proof, 'completed')]);
       if (proof === 'new turn') await events(conversationId, [openTurn('next-pro-turn')]);
       const result = await request('POST', '/goal/draft', { body: { conversationId: conversationId, turnId: 'pro-final-' + proof, clientId: 'tab-1' } });
-      // Even a canonical final cannot autonomously spend another Loop message
-      // when this source turn never reached the local MCP connector.
-      expect(result.status, JSON.stringify(result.body)).toBe(409);
+      // Only the exact completed reply may recover when after-turn delivery applies.
+      expect(result.status, JSON.stringify(result.body)).toBe(proof === 'exact' && (!finishTool || afterTurn) ? 200 : 409);
     } finally {
       resetGoalStateForTests(); await setSecret('openRouterApiKey', ''); await saveConfig(previous);
     }
@@ -12980,7 +12979,7 @@ describe('unattributed activity recovery', () => {
     } finally { resetGoalStateForTests(); await setSecret('openRouterApiKey', ''); await saveConfig(previous); vi.useRealTimers(); }
   });
 
-  it('gives a completed native Loop turn without source MCP one recovery through the real draft, activity and ack gates, then blocks the next; deliberate idle activation still works', async () => {
+  it('allows one follow-up after a completed reply without tools, then blocks the next; manual activation still works', async () => {
     const chat = 'c9494949-1111-2222-3333-444444444444';
     const goal = await import('../src/main/goal.js');
     const { readRecentEvents } = await import('../src/main/session/store.js');
@@ -13042,15 +13041,16 @@ describe('unattributed activity recovery', () => {
     } finally { globalThis.fetch = realFetch; resetGoalStateForTests(); await setSecret('openRouterApiKey', ''); await saveConfig(previous); }
   });
 
-  it.each([{ name: 'fresh active redraft', olderCompletion: false, sameStableMessageId: false },
-    { name: 'redraft after older completed turn', olderCompletion: true, sameStableMessageId: false },
-    { name: 'stable message id reused through completion', olderCompletion: false, sameStableMessageId: true }])(
-    'waits for the exact Loop redraft turn to finish before spending its no-tool completion authority ($name)', async ({ olderCompletion, sameStableMessageId }) => {
-    const chat = olderCompletion ? 'c9494949-1111-2222-3333-444444444446' : sameStableMessageId ? 'c9494949-1111-2222-3333-444444444447' : 'c9494949-1111-2222-3333-444444444445';
+  it.each([{ name: 'fresh active retry', olderCompletion: false, sameStableMessageId: false },
+    { name: 'retry after an older completed turn', olderCompletion: true, sameStableMessageId: false },
+    { name: 'stable message id reused through completion', olderCompletion: false, sameStableMessageId: true },
+    { name: 'stable message id with finish tool enabled', olderCompletion: false, sameStableMessageId: true, finishTool: true }])(
+    'waits for the exact Loop recovery turn to finish before counting a reply without tools ($name)', async ({ olderCompletion, sameStableMessageId, finishTool = false }) => {
+    const chat = olderCompletion ? 'c9494949-1111-2222-3333-444444444446' : finishTool ? 'c9494949-1111-2222-3333-444444444448' : sameStableMessageId ? 'c9494949-1111-2222-3333-444444444447' : 'c9494949-1111-2222-3333-444444444445';
     const goal = await import('../src/main/goal.js');
     const { readRecentEvents } = await import('../src/main/session/store.js');
     const previous = getConfig();
-    await saveConfig({ ...previous, goal: { ...previous.goal, enabled: true, mode: 'loop', backend: 'api', loopBackend: 'api', model: 'deepseek/deepseek-v4-flash' } });
+    await saveConfig({ ...previous, ui: { ...previous.ui, finishTool }, goal: { ...previous.goal, enabled: true, mode: 'loop', backend: 'api', loopBackend: 'api', model: 'deepseek/deepseek-v4-flash' } });
     await setSecret('openRouterApiKey', 'sk-or-loop-proof-test');
     const realFetch = globalThis.fetch;
     const helper = vi.fn(async () => Response.json({ choices: [{ message: { content: JSON.stringify({ action: 'continue', reply: 'run the tests and fix what fails' }) } }] }));
@@ -13059,9 +13059,11 @@ describe('unattributed activity recovery', () => {
       event.kind === 'progress' && event.progressId === `loop-stalled:${turnId}`);
     try {
       await pair();
-      await request('POST', '/settings', { body: { conversationId: chat, loop: true } });
-      await events(chat, [{ kind: 'model_selection', model: 'GPT-5.6 Sol', reasoningEffort: 'high', time: Date.now() },
+      await events(chat, [{ kind: 'model_selection', model: finishTool ? 'GPT-6 Pro' : 'GPT-5.6 Sol', reasoningEffort: 'high', time: Date.now() },
         { kind: 'user_message', time: Date.now(), text: 'diagnose the test suite', messageId: 'q-loop-redraft' }]);
+      await request('POST', '/settings', { body: { conversationId: chat, loop: true } });
+      await request('POST', '/settings', { body: { conversationId: chat, loopAfterTurn: true } });
+      expect((await request('GET', `/activity?conversationId=${chat}`)).body.goal).toMatchObject({ afterTurn: true });
       await events(chat, [openTurn('loop-source'), { kind: 'assistant_message', turnId: 'loop-source', messageId: 'loop-source-final',
         time: Date.now(), text: 'I cannot access the MCP tools.', final: true, state: 'final', activeNow: true, goalEligible: true }, endTurn('loop-source', 'completed')]);
       expect(goal.goalPendingReplyFor(chat)).toMatchObject({ turnId: 'loop-source' });

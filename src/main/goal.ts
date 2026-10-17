@@ -758,7 +758,7 @@ export async function automaticLoopHasMcpWork(sessionId: string, conversationId:
   return !!source && await turnHasMcpCall(sessionId, conversationId, source);
 }
 
-/** One recovery is allowed for an exact completed native final; its durable receipt stalls later no-tool turns. */
+/** Allow one follow-up after a completed reply without recorded tool use; later replies without tools stall. */
 type LoopTurnVerdict = 'work' | 'recover' | 'stalled' | 'waiting' | 'none';
 async function loopTurnVerdict(sessionId: string, conversationId: string, turnId: string): Promise<LoopTurnVerdict> {
   if (await automaticLoopHasMcpWork(sessionId, conversationId, turnId)) return 'work';
@@ -766,9 +766,6 @@ async function loopTurnVerdict(sessionId: string, conversationId: string, turnId
   const session = await getSession(sessionId);
   const finish = session?.finishTurn;
   if (!source || session?.conversationId !== conversationId || finish?.turnId !== source || finish.conversationId !== conversationId) return 'none';
-  // A finish-capable chat (Astra, Loop Pro) recovers through the held finish path instead, with its own rule.
-  const selected = session.selectedModel;
-  if (selected?.conversationId === conversationId && supportsFinishAutomation('loop', selected.model, selected.reasoningEffort)) return 'none';
   const spent = finish.noToolRedraftAt !== undefined && finish.noToolRedraftAt >= (goalSwitches.get(conversationId)?.at ?? 0);
   // Keep the exact recovery reply claimable after the typed reply becomes a newer event.
   if (spent && finish.noToolRedraftTurn === source) return 'recover';
@@ -778,6 +775,9 @@ async function loopTurnVerdict(sessionId: string, conversationId: string, turnId
   if (latestSourceBoundary?.kind === 'turn_start') return 'waiting';
   if (latestSourceBoundary?.kind !== 'turn_end' || latestSourceBoundary.outcome !== 'completed') return 'none';
   if (!await readCompletedFinal(sessionId, conversationId, source)) return 'none';
+  // Leave a completed reply to the finish tool only while that exact turn remains held.
+  const held = session.activeTurnId === source && finish.released !== true && getConfig().ui.finishTool === true;
+  if (held) return 'none';
   return spent ? 'stalled' : 'recover';
 }
 
@@ -2086,7 +2086,7 @@ async function run(draft: GoalDraft): Promise<void> {
  * then continue — as a Goal.
  */
 async function loopStalled(sessionId: string, conversationId: string, turnId: string, answered: boolean): Promise<TaskRequestError> {
-  logWarn(`goal: loop stalled for ${conversationId}; the turn after one redraft made no tool call`);
+  logWarn(`goal: loop stalled for ${conversationId}; the reply after one recovery made no tool call`);
   const { recordProgress } = await import('./session/recorder.js');
   await recordProgress(sessionId, `loop-stalled:${turnId}`, `Stalled: this Loop turn made no tool call. One recovery attempt was used${answered ? ' and no tool call followed' : ', but the helper wrote no follow-up, so nothing was delivered'}. Automatic continuation is paused; switch Loop off and on to try again.`,
     undefined, turnId);
@@ -2096,7 +2096,7 @@ async function loopStalled(sessionId: string, conversationId: string, turnId: st
 /** Spend the recovery only after the helper returns a decision. */
 async function spendLoopRedraft(sessionId: string, conversationId: string, turnId: string): Promise<boolean> {
   const { recordProgress } = await import('./session/recorder.js');
-  return !!await recordProgress(sessionId, `loop-redraft:${turnId}:${Date.now()}`, 'This Loop turn made no tool call; one recovery attempt was used. A turn that again makes none stops Loop.',
+  return !!await recordProgress(sessionId, `loop-redraft:${turnId}:${Date.now()}`, 'This Loop turn made no tool call; one recovery attempt was used. A later reply without tools stops Loop.',
     undefined, turnId, { state: 'redraft', conversationId });
 }
 
@@ -2115,11 +2115,11 @@ export async function draftFastFollowup(sessionId: string, signal: AbortSignal =
     const [start] = await readRecentEvents(sessionId, 1, { kinds: ['turn_start'] });
     const source = session.activeTurnId ?? start?.turnId;
     if (!source) return null;
-    // Only the exact held turn may be redrafted without MCP proof; a completed or foreign turn keeps its refusal.
+    // Only the exact held turn may be retried without recorded tool use; completed or foreign turns keep their refusal.
     const finish = session.finishTurn;
     const held = session.activeTurnId === source && finish?.turnId === source && finish.conversationId === session.conversationId && !finish.released &&
       getConfig().ui.finishTool === true;
-    // The one redraft is a durable receipt on the held turn (reducer in the session store), spent
+    // The single retry is recorded on the held turn and remains spent
     // until a real tool call or a Loop Off/On; a finish call alone is not tool work.
     if (held && finish.noToolRedraftAt !== undefined && finish.noToolRedraftAt >= (goalSwitches.get(session.conversationId)?.at ?? 0)) {
       throw await loopStalled(sessionId, session.conversationId, source, true);
@@ -2150,7 +2150,7 @@ export async function draftFastFollowup(sessionId: string, signal: AbortSignal =
       });
   if (redraftTurn && (decision.action === 'continue' || decision.action === 'stop')) {
     // A transport failure retries without spending it.
-    if (!await spendLoopRedraft(sessionId, session.conversationId, redraftTurn)) throw new Error('Loop redraft could not be recorded; no follow-up was sent');
+    if (!await spendLoopRedraft(sessionId, session.conversationId, redraftTurn)) throw new Error('Loop recovery could not be recorded; no follow-up was sent');
   }
   if (decision.action === 'stop') {
     if (mode === 'loop') throw redraftTurn ? await loopStalled(sessionId, session.conversationId, redraftTurn, false) : new Error('loop_stop_refused');

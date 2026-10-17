@@ -770,9 +770,9 @@ export interface SessionSummary {
     decisionSeq: number;
     decisionInputRevision: string | null;
     decisionAt?: number;
-    /** When this held turn's one no-tool Loop redraft was spent; cleared by a real tool call. */
+    /** When this held turn's one recovery was used; cleared by an exactly attributed tool call. */
     noToolRedraftAt?: number;
-    /** The turn whose finish or completion spent that redraft; a later turn finds it already spent. */
+    /** The turn whose finish or completion used that recovery; a later turn finds it already spent. */
     noToolRedraftTurn?: string;
   } | null;
   /** Agents seen in this session, prime first. Empty when no swarm ran. */

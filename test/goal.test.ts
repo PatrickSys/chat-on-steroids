@@ -2687,24 +2687,14 @@ describe('the loop that never stops', () => {
     }
   });
 
-  it('records the one no-tool redraft on the held finishTurn', async () => {
-    const sessionId = await heldNoToolTurn('c-loop-no-mcp-redraft');
-    const fetch = vi.fn(async () => decision('continue', 'run tests and fix'));
-    globalThis.fetch = fetch as never;
-
-    const followup = await goal.draftFastFollowup(sessionId);
-
-    expect(followup).toBe('run tests and fix');
-    expect(fetch).toHaveBeenCalledTimes(1);
-    expect((await getSession(sessionId))?.finishTurn?.noToolRedraftAt).toEqual(expect.any(Number));
-  });
-
-  it('spends the one redraft per held turn, survives a restart, and stalls visibly instead of calling the helper again', async () => {
+  it('uses one helper follow-up for a held Loop turn, then stalls after another reply without tools', async () => {
     const conversationId = 'c-loop-no-mcp-stalled';
     const sessionId = await heldNoToolTurn(conversationId);
     const fetch = vi.fn(async () => decision('continue', 'run tests and fix'));
     globalThis.fetch = fetch as never;
     expect(await goal.draftFastFollowup(sessionId)).toBe('run tests and fix');
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect((await getSession(sessionId))?.finishTurn?.noToolRedraftAt).toEqual(expect.any(Number));
 
     // The same held turn remains spent after the session store is rebuilt from disk.
     await flushSessions(); resetSessionStoreForTests(); initSessionStore(dir);
@@ -2712,21 +2702,21 @@ describe('the loop that never stops', () => {
     await expect(goal.draftFastFollowup(sessionId)).rejects.toThrow('loop_stalled');
     expect(fetch).toHaveBeenCalledTimes(1);
 
-    // The next turn inherits the spent redraft; a finish call alone is not tool work.
+    // The next turn inherits the spent recovery; a finish call alone is not tool work.
     await appendEvent(sessionId, { source: 'extension', time: 1200, kind: 'turn_end', turnId: 'turn-no-mcp', outcome: 'completed' });
     await appendEvent(sessionId, { source: 'extension', time: 1300, kind: 'turn_start', turnId: 'turn-no-mcp-2' });
     await mcpCall(sessionId, conversationId, 'turn-no-mcp-2', 'session_finish');
     await expect(goal.draftFastFollowup(sessionId)).rejects.toThrow('loop_stalled');
     expect(fetch).toHaveBeenCalledTimes(1);
 
-    // A real tool call clears it: the next no-tool turn gets its one redraft again.
+    // A tool call clears it so the next reply without tools gets one recovery again.
     await mcpCall(sessionId, conversationId, 'turn-no-mcp-2');
     expect((await getSession(sessionId))?.finishTurn?.noToolRedraftAt).toBeUndefined();
     expect(await goal.draftFastFollowup(sessionId)).toBe('run tests and fix');
     expect(fetch).toHaveBeenCalledTimes(2);
   });
 
-  it('counts a helper stop as the one redraft, then stalls on every later call', async () => {
+  it('counts a helper stop as the one retry, then stalls on every later call', async () => {
     const sessionId = await heldNoToolTurn('c-loop-no-mcp-stop');
     const fetch = vi.fn(async () => decision('stop'));
     globalThis.fetch = fetch as never;
@@ -2737,7 +2727,7 @@ describe('the loop that never stops', () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
-  it('is not reset or counted by a foreign or turnless tool call, nor redrafted on a foreign finish authority', async () => {
+  it('is not reset or counted by a foreign or turnless tool call, nor retried under foreign finish authority', async () => {
     const conversationId = 'c-loop-no-mcp-foreign';
     const sessionId = await heldNoToolTurn(conversationId);
     const fetch = vi.fn(async () => decision('continue', 'run tests and fix'));
@@ -2761,7 +2751,7 @@ describe('the loop that never stops', () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
-  it('gives Loop a fresh redraft after it is switched Off and On', async () => {
+  it('allows another recovery after Loop is switched Off and On', async () => {
     const conversationId = 'c-loop-no-mcp-switch';
     const sessionId = await heldNoToolTurn(conversationId);
     const fetch = vi.fn(async () => decision('continue', 'run tests and fix'));
@@ -2775,7 +2765,7 @@ describe('the loop that never stops', () => {
     expect(fetch).toHaveBeenCalledTimes(2);
   });
 
-  it('never redrafts a completed turn without recorded MCP work', async () => {
+  it('does not use a finish follow-up for a completed turn without recorded tool use', async () => {
     const sessionId = await heldNoToolTurn('c-loop-no-mcp-completed');
     const fetch = vi.fn(async () => decision('continue', 'run tests and fix'));
     globalThis.fetch = fetch as never;
@@ -2784,7 +2774,7 @@ describe('the loop that never stops', () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  // Thinking chats use the completed-native-final path; only Astra or Loop Pro can use the finish hold.
+  // Replies from chats without an active finish hold use the completed-turn path.
   const nativeCompletedTurn = async (sessionId: string, turnId: string, messageId: string, time: number): Promise<number> => {
     await appendEvent(sessionId, { source: 'extension', time, kind: 'turn_start', turnId });
     await appendEvent(sessionId, {
@@ -2806,7 +2796,7 @@ describe('the loop that never stops', () => {
   const stalledRows = async (sessionId: string, turnId: string) => (await readRecentEvents(sessionId, 80))
     .flatMap((event: any) => event.kind === 'progress' && event.progressId === `loop-stalled:${turnId}` ? [event.message.text as string] : []);
 
-  it('recovers a completed native no-MCP Loop turn exactly once through accept, draft, pending, restart and ack, then stalls visibly', async () => {
+  it('allows one follow-up after a completed reply without tools, then stalls after the next such reply', async () => {
     const conversationId = 'c-native-loop-recovery';
     const sessionId = await nativeLoopSession(conversationId);
     const fetch = vi.fn(async () => decision('continue', 'run the tests and fix what fails'));
@@ -2843,7 +2833,7 @@ describe('the loop that never stops', () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
-  it('settles a helper stop on the native recovery as a visible, non-retryable stall without asking again', async () => {
+  it('shows a visible stall when the helper asks to stop during recovery', async () => {
     const conversationId = 'c-native-loop-stop';
     const sessionId = await nativeLoopSession(conversationId);
     const fetch = vi.fn(async () => decision('stop'));
@@ -2856,20 +2846,31 @@ describe('the loop that never stops', () => {
     expect(await stalledRows(sessionId, 'turn-native-stop')).toEqual([expect.stringContaining('the helper wrote no follow-up, so nothing was delivered')]);
   });
 
-  it('leaves a finish-capable Pro chat to its held finish path: no post-turn recovery for a completed no-MCP final', async () => {
-    const conversationId = 'c-native-loop-pro';
+  it.each([false, true])('allows a Pro chat to recover a completed reply with the finish tool enabled=%s when after-turn delivery is selected', async (finishTool) => {
+    const { getConfig } = await import('../src/main/config.js');
+    await saveConfig({ ...getConfig(), ui: { ...getConfig().ui, finishTool } });
+    const conversationId = 'c-native-loop-pro-recovery';
     const sessionId = await nativeLoopSession(conversationId);
+    await goal.setGoalSwitchNow(conversationId, 'loop', true, true);
     await observeSessionModel(sessionId, conversationId, 'gpt-6-pro', Date.now());
     const fetch = vi.fn(async () => decision('continue', 'run the tests and fix what fails'));
     globalThis.fetch = fetch as never;
     await acceptNative(sessionId, conversationId, 'turn-native-pro', 'message-pro', await nativeCompletedTurn(sessionId, 'turn-native-pro', 'message-pro', 1100));
-    expect(goal.goalPendingReplyFor(conversationId)).toBeNull();
-    expect(await goal.loopReplyHasAuthority(sessionId, conversationId, 'turn-native-pro')).toBe(false);
-    expect(await stalledRows(sessionId, 'turn-native-pro')).toEqual([]);
-    expect(fetch).not.toHaveBeenCalled();
+    expect(goal.goalPendingReplyFor(conversationId)).toMatchObject({ replyId: 'message-pro', turnId: 'turn-native-pro' });
+    expect(await goal.loopReplyHasAuthority(sessionId, conversationId, 'turn-native-pro')).toBe(true);
+    goal.startGoalDraft({ sessionId, conversationId, turnId: 'turn-native-pro' });
+    expect(await settled(conversationId)).toMatchObject({ stage: 'ready' });
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 
-  it('gives the native recovery back after a real tool call or a Loop Off and On, and never to an unfinished or foreign turn', async () => {
+  it('leaves a Pro reply with its exact active finish hold', async () => {
+    const conversationId = 'c-native-loop-pro-held';
+    const sessionId = await heldNoToolTurn(conversationId, 'turn-pro-held');
+    await observeSessionModel(sessionId, conversationId, 'gpt-6-pro', Date.now());
+    expect(await goal.loopReplyHasAuthority(sessionId, conversationId, 'turn-pro-held')).toBe(false);
+  });
+
+  it('allows another recovery after a tool call or Loop Off and On, but not for an unfinished or foreign turn', async () => {
     const conversationId = 'c-native-loop-reset';
     const sessionId = await nativeLoopSession(conversationId);
     const fetch = vi.fn(async () => decision('continue', 'run the tests and fix what fails'));

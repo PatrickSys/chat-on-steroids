@@ -3675,9 +3675,11 @@ decision is generated from silence or a failed response.
 exactly attributed local MCP call in the source turn, including ordinary completed finals and
 finish follow-ups. Native page tools, another turn's calls and unattributed work do not qualify.
 **Exception:** one recovery is allowed for the exact turn held by the finish tool or the latest completed
-reply without a tool call. It is recorded as `finishControl.state='redraft'` (`finishTurn.noToolRedraftAt`,
-`noToolRedraftTurn`) and stays spent across restarts until exact attributed MCP work or Loop Off/On
-clears it. A further no-tool turn stalls visibly.
+reply without a recorded local tool call. It is recorded as `finishControl.state='redraft'` (`finishTurn.noToolRedraftAt`,
+`noToolRedraftTurn`) and remains spent across restarts until a verified local tool call is recorded for
+that turn, or Loop is turned off and on. A further reply without a recorded local tool call stalls visibly.
+The saved per-chat Loop revision changes on a real activation or master stop, not when its delivery preference changes;
+it survives while the chat inherits the app-wide switch, and recovery receipts keep it across restarts.
 The proof is existence in the exact source turn, not a requirement that its call be the latest
 stored row. Late attribution backfill without a turn must not erase earlier exact proof.
 Explicit user activation may proceed without that proof after the existing idle gate. Only the
@@ -3791,9 +3793,9 @@ bounded receipt journal distinguishes pre-send busy cancellation from successful
 lost deferral response cannot resurrect the old text. App/web name this wait explicitly.
 
 Goal/Loop/planner failures retain machine codes for retry/ownership but publish a separate readable
-explanation in app and browser. Missing MCP evidence explains that the previous response made no
-local tool call, so lost tool connectivity cannot be established; Loop remains enabled. Do not
-claim login is missing or the tunnel is off without evidence. Distinguish input size, helper output
+explanation in app and browser. Missing local tool-call evidence explains that the previous response
+had no recorded local tool call, so lost tool connectivity cannot be established; Loop remains enabled. Do not
+claim login is missing or the tool connection is off without evidence. Distinguish input size, helper output
 size, provider failures and uncertain delivery. Browser error text wraps instead of truncating.
 
 Provider progress updates one existing timeline row and is never sendable text. Validate the

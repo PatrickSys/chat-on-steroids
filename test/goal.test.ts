@@ -2666,12 +2666,12 @@ describe('the loop that never stops', () => {
     expect(seen[1]!.content).toContain('scrape the prices into a csv');
   });
 
-  const heldNoToolTurn = async (conversationId: string, turnId = 'turn-no-mcp') => {
+  const heldNoToolTurn = async (conversationId: string, turnId = 'turn-no-mcp', inheritLoop = false) => {
     await loopMode();
     const { getConfig } = await import('../src/main/config.js');
     await saveConfig({ ...getConfig(), ui: { ...getConfig().ui, finishTool: true } });
     const session = await createSession({ conversationId, title: 'loop no mcp' });
-    await goal.setGoalSwitchNow(conversationId, 'loop', true);
+    if (!inheritLoop) await goal.setGoalSwitchNow(conversationId, 'loop', true);
     await appendEvent(session.id, {
       source: 'extension', time: 1000, kind: 'user_message',
       message: { text: 'diagnose the test suite', chars: 24, truncated: false }
@@ -2687,7 +2687,7 @@ describe('the loop that never stops', () => {
     }
   });
 
-  it('uses one helper follow-up for a held Loop turn, then stalls after another reply without tools', async () => {
+  it('uses one helper follow-up for a held Loop turn, then stalls after another reply without a recorded local tool call', async () => {
     const conversationId = 'c-loop-no-mcp-stalled';
     const sessionId = await heldNoToolTurn(conversationId);
     const fetch = vi.fn(async () => decision('continue', 'run tests and fix'));
@@ -2709,14 +2709,14 @@ describe('the loop that never stops', () => {
     await expect(goal.draftFastFollowup(sessionId)).rejects.toThrow('loop_stalled');
     expect(fetch).toHaveBeenCalledTimes(1);
 
-    // A tool call clears it so the next reply without tools gets one recovery again.
+    // An exactly attributed local tool call clears it so the next reply can use one recovery.
     await mcpCall(sessionId, conversationId, 'turn-no-mcp-2');
     expect((await getSession(sessionId))?.finishTurn?.noToolRedraftAt).toBeUndefined();
     expect(await goal.draftFastFollowup(sessionId)).toBe('run tests and fix');
     expect(fetch).toHaveBeenCalledTimes(2);
   });
 
-  it('counts a helper stop as the one retry, then stalls on every later call', async () => {
+  it('counts a helper stop against this turn’s recovery, then stalls on repeated attempts', async () => {
     const sessionId = await heldNoToolTurn('c-loop-no-mcp-stop');
     const fetch = vi.fn(async () => decision('stop'));
     globalThis.fetch = fetch as never;
@@ -2740,7 +2740,7 @@ describe('the loop that never stops', () => {
     await expect(goal.draftFastFollowup(sessionId)).rejects.toThrow('loop_stalled');
     expect(fetch).toHaveBeenCalledTimes(1);
     const stalled: any = (await readRecentEvents(sessionId, 50)).find((event: any) => event.progressId === 'loop-stalled:turn-no-mcp');
-    expect(stalled?.message?.text).toContain('One recovery attempt was used and no tool call followed');
+    expect(stalled?.message?.text).toContain('One recovery attempt was used and no local tool call followed');
 
     // A foreign finish authority grants no recovery.
     const foreign = await heldNoToolTurn('c-loop-no-mcp-foreign-finish', 'turn-foreign');
@@ -2796,7 +2796,7 @@ describe('the loop that never stops', () => {
   const stalledRows = async (sessionId: string, turnId: string) => (await readRecentEvents(sessionId, 80))
     .flatMap((event: any) => event.kind === 'progress' && event.progressId === `loop-stalled:${turnId}` ? [event.message.text as string] : []);
 
-  it('allows one follow-up after a completed reply without tools, then stalls after the next such reply', async () => {
+  it('allows one follow-up after a reply without a recorded local tool call, then stalls after the next one', async () => {
     const conversationId = 'c-native-loop-recovery';
     const sessionId = await nativeLoopSession(conversationId);
     const fetch = vi.fn(async () => decision('continue', 'run the tests and fix what fails'));
@@ -2827,7 +2827,7 @@ describe('the loop that never stops', () => {
     await acceptNative(sessionId, conversationId, 'turn-native-2', 'message-2', await nativeCompletedTurn(sessionId, 'turn-native-2', 'message-2', 1400));
     expect(goal.goalPendingReplyFor(conversationId)).toBeNull();
     expect(await goal.loopReplyHasAuthority(sessionId, conversationId, 'turn-native-2')).toBe(false);
-    expect(await stalledRows(sessionId, 'turn-native-2')).toEqual([expect.stringContaining('Stalled: this Loop turn made no tool call. One recovery attempt was used and no tool call followed')]);
+    expect(await stalledRows(sessionId, 'turn-native-2')).toEqual([expect.stringContaining('Stalled: this Loop turn had no recorded local tool call. One recovery attempt was used and no local tool call followed')]);
     goal.startGoalDraft({ sessionId, conversationId, turnId: 'turn-native-2' });
     expect(await settled(conversationId)).toMatchObject({ stage: 'no-reply' });
     expect(fetch).toHaveBeenCalledTimes(1);
@@ -2863,7 +2863,7 @@ describe('the loop that never stops', () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
-  it('leaves a Pro reply with its exact active finish hold', async () => {
+  it('does not recover a GPT-6 Pro reply while that exact turn is held for finish', async () => {
     const conversationId = 'c-native-loop-pro-held';
     const sessionId = await heldNoToolTurn(conversationId, 'turn-pro-held');
     await observeSessionModel(sessionId, conversationId, 'gpt-6-pro', Date.now());
@@ -2906,6 +2906,56 @@ describe('the loop that never stops', () => {
     await appendEvent(sessionId, { source: 'extension', time: 2700, kind: 'assistant_message', turnId: 'turn-reset-6', messageId: 'm-turn-reset-6', final: true, message: { text: 'done', chars: 4, truncated: false } });
     await appendEvent(sessionId, { source: 'extension', time: 2800, kind: 'turn_end', turnId: 'turn-reset-6', outcome: 'completed' });
     expect(await goal.loopReplyHasAuthority(sessionId, conversationId, 'turn-reset-6')).toBe(false);
+  });
+
+  it('keeps a spent recovery after changing after-turn delivery while Loop stays on', async () => {
+    const conversationId = 'c-native-loop-delivery-change';
+    const sessionId = await heldNoToolTurn(conversationId, 'turn-delivery-change');
+    const fetch = vi.fn(async () => decision('continue', 'run the tests and fix what fails'));
+    globalThis.fetch = fetch as never;
+    const now = vi.spyOn(Date, 'now').mockReturnValue(2_000_000_000_000);
+    try {
+      expect(await goal.draftFastFollowup(sessionId)).toBe('run the tests and fix what fails');
+      now.mockReturnValue(2_000_000_000_010);
+      await goal.setGoalSwitchNow(conversationId, 'loop', true, true);
+      await expect(goal.draftFastFollowup(sessionId)).rejects.toThrow('loop_stalled');
+      expect(fetch).toHaveBeenCalledTimes(1);
+      goal.restoreGoalSwitches(goal.snapshotGoalSwitches());
+      await expect(goal.draftFastFollowup(sessionId)).rejects.toThrow('loop_stalled');
+      await goal.setGoalSwitchNow(conversationId, 'loop', false);
+      await goal.setGoalSwitchNow(conversationId, 'loop', true);
+      expect(await goal.draftFastFollowup(sessionId)).toBe('run the tests and fix what fails');
+      await expect(goal.draftFastFollowup(sessionId)).rejects.toThrow('loop_stalled');
+      expect(fetch).toHaveBeenCalledTimes(2);
+      goal.clearGoalSwitch(conversationId);
+      await goal.setGoalSwitchNow(conversationId, 'loop', true);
+      await expect(goal.draftFastFollowup(sessionId)).rejects.toThrow('loop_stalled');
+      expect(fetch).toHaveBeenCalledTimes(2);
+    } finally { now.mockRestore(); }
+  });
+
+  it('re-arms one spent recovery after master Loop Off and On', async () => {
+    const conversationId = 'c-native-loop-master-reset';
+    const sessionId = await heldNoToolTurn(conversationId, 'turn-master-reset', true);
+    const fetch = vi.fn(async () => decision('continue', 'run the tests and fix what fails'));
+    globalThis.fetch = fetch as never;
+    expect(goal.goalSwitchFor(conversationId)).toMatchObject({ own: false, enabled: true, mode: 'loop' });
+    expect(await goal.draftFastFollowup(sessionId)).toBe('run the tests and fix what fails');
+    expect((await getSession(sessionId))?.finishTurn?.noToolRedraftRevision).toBe(0);
+    expect(goal.goalSwitchFor(conversationId)).toMatchObject({ own: false, enabled: true, mode: 'loop' });
+
+    goal.clearGoalSwitch(conversationId);
+    expect(goal.goalSwitchFor(conversationId)).toMatchObject({ own: false, enabled: true, mode: 'loop' });
+    const { getConfig } = await import('../src/main/config.js');
+    const config = getConfig();
+    await saveConfig({ ...config, goal: { ...config.goal, enabled: false } });
+    goal.clearAllGoalSwitches();
+    expect(goal.goalSwitchFor(conversationId).own).toBe(false);
+    await saveConfig({ ...getConfig(), goal: { ...config.goal, enabled: true } });
+
+    expect(await goal.draftFastFollowup(sessionId)).toBe('run the tests and fix what fails');
+    await expect(goal.draftFastFollowup(sessionId)).rejects.toThrow('loop_stalled');
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
 });
 

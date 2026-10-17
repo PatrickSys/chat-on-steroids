@@ -12979,7 +12979,7 @@ describe('unattributed activity recovery', () => {
     } finally { resetGoalStateForTests(); await setSecret('openRouterApiKey', ''); await saveConfig(previous); vi.useRealTimers(); }
   });
 
-  it('allows one follow-up after a completed reply without tools, then blocks the next; manual activation still works', async () => {
+  it('allows one follow-up after a reply without a recorded local tool call, then blocks the next; manual activation still works', async () => {
     const chat = 'c9494949-1111-2222-3333-444444444444';
     const goal = await import('../src/main/goal.js');
     const { readRecentEvents } = await import('../src/main/session/store.js');
@@ -13021,7 +13021,7 @@ describe('unattributed activity recovery', () => {
       const refused = await request('POST', '/goal/draft', { body: { conversationId: chat, turnId: 'loop-without-mcp-2' } });
       expect(refused.status).toBe(409);
       expect(refused.body).toMatchObject({ error: 'loop_mcp_call_missing', retryable: false });
-      expect(refused.body.message).toContain('No MCP tool call was recorded in the last response');
+      expect(refused.body.message).toContain('No local tool call was recorded for the last reply');
       expect(refused.body.message).toContain('ChatGPT may be asking you something');
       expect(refused.body.message).toContain('the tool connection may have been lost');
       expect(refused.body.message).toContain('Answer it');
@@ -13029,7 +13029,7 @@ describe('unattributed activity recovery', () => {
       const sessionId = goal.snapshotGoalReplies().replies.find(row => row.conversationId === chat)!.sessionId;
       const stalled = (await readRecentEvents(sessionId, 80)).flatMap((event: any) =>
         event.kind === 'progress' && event.progressId === 'loop-stalled:loop-without-mcp-2' ? [event.message.text as string] : []);
-      expect(stalled).toEqual([expect.stringContaining('Stalled: this Loop turn made no tool call.')]);
+      expect(stalled).toEqual([expect.stringContaining('Stalled: this Loop turn had no recorded local tool call.')]);
       expect(helper).toHaveBeenCalledTimes(1);
 
       await request('POST', '/settings', { body: { conversationId: chat, loop: false } });
@@ -13045,7 +13045,7 @@ describe('unattributed activity recovery', () => {
     { name: 'retry after an older completed turn', olderCompletion: true, sameStableMessageId: false },
     { name: 'stable message id reused through completion', olderCompletion: false, sameStableMessageId: true },
     { name: 'stable message id with finish tool enabled', olderCompletion: false, sameStableMessageId: true, finishTool: true }])(
-    'waits for the exact Loop recovery turn to finish before counting a reply without tools ($name)', async ({ olderCompletion, sameStableMessageId, finishTool = false }) => {
+    'waits for the exact Loop recovery turn to finish before counting a reply without a recorded local tool call ($name)', async ({ olderCompletion, sameStableMessageId, finishTool = false }) => {
     const chat = olderCompletion ? 'c9494949-1111-2222-3333-444444444446' : finishTool ? 'c9494949-1111-2222-3333-444444444448' : sameStableMessageId ? 'c9494949-1111-2222-3333-444444444447' : 'c9494949-1111-2222-3333-444444444445';
     const goal = await import('../src/main/goal.js');
     const { readRecentEvents } = await import('../src/main/session/store.js');

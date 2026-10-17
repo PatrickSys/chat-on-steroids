@@ -194,13 +194,13 @@ describe('session finish turn identity', () => {
     expect(notify).not.toHaveBeenCalled();
     expect(hooks.enqueue).toHaveBeenCalledWith(expect.objectContaining({ mode: 'auto' }), { turnId: 'turn-one', periodic: false, mode });
   });
-  it('explains when Loop stops after a reply without tools and queues nothing', async () => {
+  it('explains when Loop stops after a reply without a recorded local tool call', async () => {
     hooks.followup.mockRejectedValueOnce(new TaskRequestError('loop_stalled', false));
     await setGoalSwitchNow(hooks.caller.conversationId, 'loop', true);
     await announceSessionFinish(sessionId, 'No tools were used');
     const rows = (await readRecentEvents(sessionId, 50, { kinds: ['progress'] }))
       .flatMap(event => event.kind === 'progress' ? [event.message.text] : []);
-    expect(rows.some(text => text.startsWith('Loop stalled.') && text.includes('ChatGPT did not use any tools in its last reply') &&
+    expect(rows.some(text => text.startsWith('Loop stalled.') && text.includes('No local tool call was recorded for the last reply') &&
       text.includes('Automatic continuation is paused') && text.includes('Loop remains enabled'))).toBe(true);
     expect(rows.some(text => text.includes('An automatic Goal instruction is queued'))).toBe(false);
     expect(hooks.followup).toHaveBeenCalledOnce();

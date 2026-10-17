@@ -750,7 +750,7 @@ export async function goalReplySourceTurn(sessionId: string, turnId: string): Pr
   return events.find(event => event.kind === 'assistant_message' && event.messageId === turnId.slice(6))?.turnId ?? undefined;
 }
 
-/** Automatic Loop pickup needs local MCP truth from this exact source, not page tools. */
+/** Automatic Loop pickup requires a recorded local tool call in this exact source turn. */
 export async function automaticLoopHasMcpWork(sessionId: string, conversationId: string, turnId: string): Promise<boolean> {
   const session = await getSession(sessionId);
   if (session?.conversationId !== conversationId) return false;
@@ -758,7 +758,7 @@ export async function automaticLoopHasMcpWork(sessionId: string, conversationId:
   return !!source && await turnHasMcpCall(sessionId, conversationId, source);
 }
 
-/** Allow one follow-up after a completed reply without recorded tool use; later replies without tools stall. */
+/** Allow one follow-up after a completed reply without a recorded local tool call. */
 type LoopTurnVerdict = 'work' | 'recover' | 'stalled' | 'waiting' | 'none';
 async function loopTurnVerdict(sessionId: string, conversationId: string, turnId: string): Promise<LoopTurnVerdict> {
   if (await automaticLoopHasMcpWork(sessionId, conversationId, turnId)) return 'work';
@@ -766,8 +766,9 @@ async function loopTurnVerdict(sessionId: string, conversationId: string, turnId
   const session = await getSession(sessionId);
   const finish = session?.finishTurn;
   if (!source || session?.conversationId !== conversationId || finish?.turnId !== source || finish.conversationId !== conversationId) return 'none';
-  const spent = finish.noToolRedraftAt !== undefined && finish.noToolRedraftAt >= (goalSwitches.get(conversationId)?.at ?? 0);
-  // Keep the exact recovery reply claimable after the typed reply becomes a newer event.
+  const spent = finish.noToolRedraftAt !== undefined &&
+    (finish.noToolRedraftRevision ?? 0) === (goalSwitches.get(conversationId)?.loopRecoveryRevision ?? 0);
+  // Keep the original reply eligible while its recovery follow-up is pending.
   if (spent && finish.noToolRedraftTurn === source) return 'recover';
   // A provider final can be observed while its generation is still active; only the latest exact boundary grants completion.
   const latestSourceBoundary = (await readRecentEvents(sessionId, 256, { kinds: ['turn_start', 'turn_end'] }))
@@ -1028,7 +1029,7 @@ export interface GoalSwitchesSnapshot {
  * old conversation is retired: turning Goal off where it pops up writes `enabled: false` for
  * that chat alone, and no later app-wide change can revive it.
  */
-type GoalSwitchRow = { enabled: boolean; mode: GoalMode; afterTurn?: boolean; at: number; role?: 'decision'; sourceSessionId?: string;
+type GoalSwitchRow = { enabled: boolean; mode: GoalMode; afterTurn?: boolean; at: number; loopRecoveryRevision?: number; inherit?: true; role?: 'decision'; sourceSessionId?: string;
   context?: { count: number; hash: string; instructions: string } };
 const goalSwitches = new Map<string, GoalSwitchRow>();
 let goalSwitchWrites: Promise<unknown> = Promise.resolve();
@@ -1087,6 +1088,8 @@ export function restoreGoalSwitches(snapshot: GoalSwitchesSnapshot | null): void
     const context = sourceSessionId && raw.context && Number.isSafeInteger(raw.context.count) && raw.context.count >= 0
       && /^[a-f0-9]{64}$/.test(raw.context.hash) && /^[a-f0-9]{64}$/.test(raw.context.instructions) ? raw.context : undefined;
     goalSwitches.set(raw.conversationId, { enabled: raw.role === 'decision' ? false : raw.enabled, mode: raw.mode, at,
+      loopRecoveryRevision: typeof raw.loopRecoveryRevision === 'number' && Number.isSafeInteger(raw.loopRecoveryRevision) && raw.loopRecoveryRevision >= 0 ? raw.loopRecoveryRevision : 0,
+      ...(raw.inherit === true && raw.role !== 'decision' ? { inherit: true as const } : {}),
       ...(raw.afterTurn === true && raw.role !== 'decision' ? { afterTurn: true } : {}),
       ...(raw.role === 'decision' ? { role: 'decision' as const, sourceSessionId, context } : {}) });
   }
@@ -1100,7 +1103,7 @@ function persistGoalSwitches(): void {
 /** This chat's switch: its own override when it has one, otherwise the app-wide setting. */
 export function goalSwitchFor(conversationId: string): { enabled: boolean; mode: GoalMode; own: boolean; afterTurn: boolean } {
   const own = goalSwitches.get(conversationId);
-  if (own) return { enabled: own.role !== 'decision' && own.enabled, mode: own.mode, own: true, afterTurn: own.afterTurn === true };
+  if (own && !own.inherit) return { enabled: own.role !== 'decision' && own.enabled, mode: own.mode, own: true, afterTurn: own.afterTurn === true };
   const goal = getConfig().goal;
   return { enabled: goal.enabled, mode: goal.mode, own: false, afterTurn: false };
 }
@@ -1183,9 +1186,13 @@ export async function setGoalSwitchNow(
       if (!before && [...goalSwitches.values()].filter(row => row.role === 'decision').length >= MAX_GOAL_SWITCHES) {
         throw new Error('goal_switch_capacity');
       }
-      const next = applyGoalSwitch(goalSwitchFor(targetConversationId), which, on);
+      const current = goalSwitchFor(targetConversationId);
+      const next = applyGoalSwitch(current, which, on);
       const staged = new Map(goalSwitches);
-      staged.set(targetConversationId, { enabled: next.enabled, mode: next.mode,
+      const wasLoopEnabled = current.enabled && current.mode === 'loop';
+      const isLoopEnabled = next.enabled && next.mode === 'loop';
+      const loopRecoveryRevision = (before?.loopRecoveryRevision ?? 0) + Number(isLoopEnabled && !wasLoopEnabled);
+      staged.set(targetConversationId, { enabled: next.enabled, mode: next.mode, loopRecoveryRevision,
         afterTurn: afterTurn ?? before?.afterTurn ?? false, at: Date.now() });
       boundGoalSwitches(staged);
       return {
@@ -1210,7 +1217,10 @@ export async function setGoalSwitchNow(
 export function clearAllGoalSwitches(): void {
   invalidateGoalControlWrites(pendingGoalSwitches);
   if (goalSwitches.size === 0) return;
-  for (const [id, row] of goalSwitches) if (row.role !== 'decision') goalSwitches.delete(id);
+  for (const [id, row] of goalSwitches) if (row.role !== 'decision') {
+    goalSwitches.set(id, { enabled: false, mode: 'goal', at: Date.now(), inherit: true,
+      loopRecoveryRevision: (row.loopRecoveryRevision ?? 0) + 1 });
+  }
   persistGoalSwitches();
 }
 
@@ -1218,7 +1228,11 @@ export function clearAllGoalSwitches(): void {
 export function clearGoalSwitch(conversationId: string): void {
   if (isGoalDecisionChat(conversationId)) return;
   invalidateGoalControlWrites(pendingGoalSwitches, [conversationId]);
-  if (goalSwitches.delete(conversationId)) persistGoalSwitches();
+  const row = goalSwitches.get(conversationId);
+  if (!row) return;
+  goalSwitches.set(conversationId, { enabled: false, mode: 'goal', at: Date.now(), inherit: true,
+    loopRecoveryRevision: row.loopRecoveryRevision ?? 0 });
+  persistGoalSwitches();
 }
 
 /** Moves one chat-owned switch to the replacement conversation used by Compact & Resume. */
@@ -2086,9 +2100,9 @@ async function run(draft: GoalDraft): Promise<void> {
  * then continue — as a Goal.
  */
 async function loopStalled(sessionId: string, conversationId: string, turnId: string, answered: boolean): Promise<TaskRequestError> {
-  logWarn(`goal: loop stalled for ${conversationId}; the reply after one recovery made no tool call`);
+  logWarn(`goal: loop stalled for ${conversationId}`);
   const { recordProgress } = await import('./session/recorder.js');
-  await recordProgress(sessionId, `loop-stalled:${turnId}`, `Stalled: this Loop turn made no tool call. One recovery attempt was used${answered ? ' and no tool call followed' : ', but the helper wrote no follow-up, so nothing was delivered'}. Automatic continuation is paused; switch Loop off and on to try again.`,
+  await recordProgress(sessionId, `loop-stalled:${turnId}`, `Stalled: this Loop turn had no recorded local tool call. One recovery attempt was used${answered ? ' and no local tool call followed' : ', but the helper wrote no follow-up, so nothing was delivered'}. Automatic continuation is paused; switch Loop off and on to try again.`,
     undefined, turnId);
   return new TaskRequestError('loop_stalled', false);
 }
@@ -2096,8 +2110,13 @@ async function loopStalled(sessionId: string, conversationId: string, turnId: st
 /** Spend the recovery only after the helper returns a decision. */
 async function spendLoopRedraft(sessionId: string, conversationId: string, turnId: string): Promise<boolean> {
   const { recordProgress } = await import('./session/recorder.js');
-  return !!await recordProgress(sessionId, `loop-redraft:${turnId}:${Date.now()}`, 'This Loop turn made no tool call; one recovery attempt was used. A later reply without tools stops Loop.',
-    undefined, turnId, { state: 'redraft', conversationId });
+  if (!goalSwitches.has(conversationId)) {
+    goalSwitches.set(conversationId, { enabled: false, mode: 'goal', at: Date.now(), inherit: true, loopRecoveryRevision: 0 });
+    boundGoalSwitches();
+    persistGoalSwitches();
+  }
+  return !!await recordProgress(sessionId, `loop-redraft:${turnId}:${Date.now()}`, 'This turn had no recorded local tool call. If the next reply also has none, Loop will pause.',
+    undefined, turnId, { state: 'redraft', conversationId, loopRecoveryRevision: goalSwitches.get(conversationId)?.loopRecoveryRevision ?? 0 });
 }
 
 /** Finish uses the selected Goal/Loop driver; its caller owns delivery and hold release. */
@@ -2119,9 +2138,9 @@ export async function draftFastFollowup(sessionId: string, signal: AbortSignal =
     const finish = session.finishTurn;
     const held = session.activeTurnId === source && finish?.turnId === source && finish.conversationId === session.conversationId && !finish.released &&
       getConfig().ui.finishTool === true;
-    // The single retry is recorded on the held turn and remains spent
-    // until a real tool call or a Loop Off/On; a finish call alone is not tool work.
-    if (held && finish.noToolRedraftAt !== undefined && finish.noToolRedraftAt >= (goalSwitches.get(session.conversationId)?.at ?? 0)) {
+    // The single retry remains spent until exact local tool evidence or a fresh Loop activation.
+    if (held && finish.noToolRedraftAt !== undefined &&
+        (finish.noToolRedraftRevision ?? 0) === (goalSwitches.get(session.conversationId)?.loopRecoveryRevision ?? 0)) {
       throw await loopStalled(sessionId, session.conversationId, source, true);
     }
     if (!await automaticLoopHasMcpWork(sessionId, session.conversationId, source)) {

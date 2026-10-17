@@ -181,7 +181,7 @@ async function prepareNotice(sessionId: string, summary: string, userRequested =
       }
     } catch (error) {
       const detail = (error as Error).message;
-      result = detail === 'loop_stalled' ? `Loop stalled. ChatGPT did not use any tools in its last reply. Answer any question or check the tool connection. Automatic continuation is paused; Loop remains enabled. ${REMAINING}`
+      result = detail === 'loop_stalled' ? `Loop stalled. No local tool call was recorded for the last reply. Answer any question or check the tool connection. Automatic continuation is paused; Loop remains enabled. ${REMAINING}`
         : `${notification} Goal follow-up was not available: ${detail}. ${REMAINING}`;
     } finally { stopInput(); stopSession(); stopGoal(); }
     await recordProgress(sessionId, progressId, result, anchor, turnId);

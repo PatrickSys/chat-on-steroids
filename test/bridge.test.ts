@@ -13324,6 +13324,8 @@ describe('unattributed activity recovery', () => {
     { model: 'GPT-5.6 Sol', finishTool: false, afterTurn: false, splitEnd: true },
     { model: 'GPT-6 Pro', finishTool: true, afterTurn: true, splitEnd: true },
     { model: 'GPT-5.6 Sol', finishTool: false, afterTurn: false, outcome: 'stopped' },
+    // An upstream turn rotation interrupts the source turn before the fresh answer starts.
+    { model: 'GPT-5.6 Sol', finishTool: false, afterTurn: false, outcome: 'interrupted' },
     { model: 'GPT-6 Pro', finishTool: false, afterTurn: false, outcome: 'failed' }
   ])('records one no-tool Loop diagnostic only after completion ($model, finish=$finishTool, split=$splitEnd, outcome=$outcome)', async ({ model, finishTool, afterTurn, finishOnly = false, splitEnd = false, outcome = 'completed' }) => {
     const chat = randomUUID();

@@ -2532,8 +2532,18 @@ async function recordChatObservationsNow(
   // Reload republishes historical request-owned finals as activeNow, including HTML-only
   // revisions. They cannot retire current activity or its recovery deadline. Use the same
   // canonical completion verdict after the whole batch, including any newer question/work.
-  const completion = recoveredFinal || terminalFinalAt !== undefined
-    ? await readCompletedFinal(sessionId, conversationId, live?.turnId ?? recoveredFinal?.turnId) : null;
+  const completion = recoveredFinal || terminalFinalAt !== undefined || activity.endedTurnId
+    ? await readCompletedFinal(sessionId, conversationId, live?.turnId ?? recoveredFinal?.turnId ?? activity.endedTurnId) : null;
+  // A final and its completed end can arrive in different batches. Re-offer the same
+  // eligible assistant identity once completion, rather than its appearance, is known.
+  if (completion && activity.endedTurnId && !goalCandidates.some(candidate => candidate.replyId === completion.messageId)) {
+    const [final] = await readRecentEvents(sessionId, 1, { kinds: ['assistant_message'],
+      acceptEvent: event => event.kind === 'assistant_message' && event.messageId === completion.messageId });
+    if (final?.kind === 'assistant_message' && final.goalEligible === true) goalCandidates.push({
+      replyId: completion.messageId, turnId: final.turnId ?? 'reply:' + completion.messageId,
+      eventSeq: final.origin ?? final.seq
+    });
+  }
   if (terminalFinalAt !== undefined && completion) {
     activity.meaningful = true;
     activity.at = Math.max(activity.at ?? 0, terminalFinalAt);
@@ -2593,7 +2603,7 @@ export async function recordProgress(
   text: string,
   anchor?: { seq: number; time: number },
   turnId?: string | null,
-  finishControl?: Extract<SessionEvent, { kind: 'progress' }>['finishControl']
+  finishControl?: { state: 'released' | 'notified' | 'decision'; conversationId: string; revision?: string; inputRevision?: string; workSeq?: number }
 ): Promise<{ seq: number; time: number } | null> {
   if (!recordingEnabled() || !progressId) return null;
   const time = anchor?.time ?? Date.now();

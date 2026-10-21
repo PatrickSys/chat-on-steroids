@@ -13354,7 +13354,7 @@ describe('unattributed activity recovery', () => {
       const rows = await diagnostics();
       expect(rows).toHaveLength(outcome === 'completed' && !finishOnly ? 1 : 0);
       if (outcome === 'completed' && !finishOnly) expect(rows[0]).toMatchObject({ source: 'app', turnId: 'no-tool-turn',
-        message: { text: expect.stringContaining('No local tool call was recorded') } });
+        message: { text: expect.stringContaining('no local tool call was recorded for it') } });
       expect(goalPendingReplyFor(chat)).toBeNull();
       expect(goal.goalViewFor(chat)).toBeNull();
       expect(goal.goalSwitchFor(chat)).toMatchObject({ enabled: true, mode: 'loop' });

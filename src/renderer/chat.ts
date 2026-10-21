@@ -15,7 +15,7 @@ import { createFilePanel } from './file-panel.js';
 import { renderAgentPlan } from './agent-plan.js';
 import { userPromptText } from '../shared/user-prompt.js';
 import { messageReaction, withoutMessageReaction } from '../shared/message-reaction.js';
-import { goalErrorMessage } from '../shared/goal-errors.js';
+import { goalErrorMessage, LOOP_MCP_CALL_MISSING_NOTICE } from '../shared/goal-errors.js';
 import type { GoalModel } from '../shared/goal-reasoning.js';
 import { renderGoalReasoning } from './goal-reasoning.js';
 import { MAX_TASK_REQUEST_CHARS, taskRequestProblem } from '../shared/task-progress.js';
@@ -2416,6 +2416,10 @@ function localizedGoalError(error: string): string {
   if (code) return t('The continuation could not proceed. Check the app diagnostics for details ({0}).', [code[1]!]);
   return t(message);
 }
+/** Only translate this exact app-authored Loop notice; older timeline wording remains as recorded. */
+function loopStalledNoticeText(text: string): string {
+  return text === LOOP_MCP_CALL_MISSING_NOTICE ? t(LOOP_MCP_CALL_MISSING_NOTICE) : text;
+}
 function paintGoalProgress(): void {
   let row = document.getElementById('goalLifecycle');
   if (!row) { row = el('div', 'queued-input'); row.id = 'goalLifecycle'; row.setAttribute('role', 'status'); $('activeGoalRow').before(row); }
@@ -4461,6 +4465,7 @@ function eventBody(event: SessionEvent, context?: { id: string; current: () => b
       return box;
     }
     case 'progress': {
+      if (event.progressId?.startsWith('loop-stalled:')) return el('p', 'meta is-progress', () => loopStalledNoticeText(event.message.text));
       if (!event.progressId?.startsWith(APPROVAL_PROGRESS_PREFIX)) return el('p', 'meta is-progress', event.message.text);
       // ChatGPT's own tool approval card stands in this chat's page (approval-wait.ts). The app
       // writes the English source; only the user can answer the card, so the row opens the page.

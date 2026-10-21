@@ -592,6 +592,22 @@ it.each(['compaction', 'blocked', 'worker'])('retires %s control status when lea
   expect(status.textContent).not.toBe('');
 });
 
+it('shows the no-tool Loop timeline note in the selected interface language', async () => {
+  const source = 'Loop did not continue after this reply: no local tool call was recorded for it. Answer any question, or check the tool connection; Loop stays on.';
+  const { w } = await boot([{
+    seq: 1, time: T0, source: 'app', kind: 'progress', progressId: 'loop-stalled:turn-1', turnId: 'turn-1',
+    message: text(source)
+  }]);
+  const { setLanguage } = await import('../src/renderer/i18n.js');
+  setLanguage('de');
+  const note = w.document.querySelector('.ev-progress .meta')!;
+  expect(note.textContent).not.toBe(source);
+  expect(note.textContent).toContain('Loop');
+  expect(note.textContent).toContain('Tool-Aufruf');
+  setLanguage('en');
+  expect(note.textContent).toBe(source);
+});
+
 it('asks for the selected chat\'s background tab once per switch (#1249)', async () => {
   const first = summary([]), second = { ...summary([]), id: '2026-09-02-test0002', title: 'Other session' };
   const { w } = await boot([], true, [], [], { sessions: [first, second] });

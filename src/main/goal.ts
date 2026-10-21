@@ -43,7 +43,7 @@
  */
 
 import { requestBrowserDecision, authorizeBrowserHelperRetry } from './session/input.js';
-import { goalErrorKey, goalErrorMessage } from '../shared/goal-errors.js';
+import { goalErrorKey, goalErrorMessage, LOOP_MCP_CALL_MISSING_NOTICE } from '../shared/goal-errors.js';
 import { userPromptText } from '../shared/user-prompt.js';
 import { planProgressText, type TaskProgressUpdate } from '../shared/task-progress.js';
 import { TaskRequestError } from './task-request.js';
@@ -711,7 +711,7 @@ async function acceptGoalReply(input: {
     if (!recorded) {
       const { recordProgress } = await import('./session/recorder.js');
       if (!await recordProgress(input.sessionId, progressId,
-        'Loop paused: No local tool call was recorded for the last reply. Answer any question or check the tool connection. Automatic continuation is paused; Loop remains enabled.',
+        LOOP_MCP_CALL_MISSING_NOTICE,
         undefined, stalledTurn)) throw new Error('Loop diagnostic could not be recorded');
     }
   }

@@ -3674,6 +3674,9 @@ A responsive page flushes native progress and Stop before the main claim, then r
 captured work/question/document after the claim. An explicit veto or navigation prevents the
 browser action. An unresponsive page supplies no new proof; the original main-process grant
 still requires independent validation. These checks use existing RPC and repair owners.
+When a later page-status or compaction-resume probe yields, repeat that same exact
+document/question/progress fence before reloading. The probe cannot extend an old claim
+across navigation, document replacement or newly observed work.
 A veto names its reason (`why`: page-changed, stop-requested, tool-running, sending, page-busy,
 compaction, draft, changed). The extension reports it with `/status?repairHeld=<token>&why=`, which
 hands nothing out and changes no repair; the app logs each token and reason once (#820).
@@ -3717,6 +3720,10 @@ Stop/draft/tool, completion and after-turn gates continue to own action; no new 
 the page has been hidden, 0 while visible; a repeated hidden event does not restart it). Diagnostics
 only (#1752/#1837): the report shows them with the tab's page status, so a report can tell whether a
 hidden page explains late progress or unattributed calls. Nothing decides on them.
+For a question already settled by the app, a persistent Stop button alone cannot create a
+replacement local turn. Require fresh canonical response text or new thinking/tool identities
+against the retained native baseline; initial history hydration and metadata-only revisions
+are not progress. Preserve the pre-Retry baseline so a genuine first Retry response is recorded.
 The renderer keeps acknowledged Reloaded/Reopened receipts visible after tools resume, colors
 those notices with the existing accent, and explains the one-error-reload budget and subsequent
 silence wait. Trying/failed receipts do not prove a reload; only actual completion is resolved.

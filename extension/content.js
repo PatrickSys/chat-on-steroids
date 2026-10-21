@@ -532,6 +532,8 @@
    * it is a generation. See claimUnrecordedGeneration.
    */
   let unrecordedGeneratingSince = 0;
+  // Observation evidence for this question's settle window, never send authority.
+  let unrecordedGenerationBaseline = null;
   /** The native finals Fiber had reported when that generation was first seen (#1226). */
   let finalsBeforeUnrecorded = null;
   /**
@@ -1728,6 +1730,36 @@
    * only continuous silence closes it: one final answer under the resumed id, one `turn_end`.
    * A stop button that comes back inside the window simply cancels it.
    */
+  // Compare only the response after the latest question. Remounts, HTML enrichment and
+  // revisions of an existing activity label are not new work. The first Fiber view is
+  // history without prior proof. Retain an idle/final native view across Retry so its
+  // first output can prove new work even when no further snapshot changes follow.
+  function settledGenerationProgress(questionId, observedTurns, nowGenerating) {
+    const question = observedTurns.findLastIndex(turn => turn.role === 'user');
+    if (question < 0 || !CLF_DOM.messagesIn(observedTurns[question]).some(message => message.id === questionId)) return false;
+    const response = observedTurns.slice(question + 1).filter(turn => turn.role === 'assistant');
+    const fiber = response.map(turn => fiberTurnFor(turn)).filter(Boolean);
+    if (unrecordedGenerationBaseline?.questionId !== questionId || (!nowGenerating && fiber.length)) {
+      unrecordedGenerationBaseline = { questionId, fiber: fiber.length ? fiber : null, progressed: false };
+      return false;
+    }
+    const baseline = unrecordedGenerationBaseline;
+    if (fiber.length && !baseline.fiber) baseline.fiber = fiber;
+    else if (fiber.length) {
+      const previousMessages = baseline.fiber.flatMap(turn => turn.messages || []);
+      const previousCalls = baseline.fiber.flatMap(turn => turn.calls || []);
+      const previousActivities = baseline.fiber.flatMap(turn => turn.activities || []);
+      if (fiber.some(turn =>
+        (turn.messages || []).some(message => message.role !== 'user' && message.rawText &&
+          !previousMessages.some(prior => prior.messageId === message.messageId && prior.rawText === message.rawText)) ||
+        (turn.calls || []).some(call => !previousCalls.some(prior => prior.messageId === call.messageId)) ||
+        (turn.activities || []).some(activity => !previousActivities.some(prior => prior.messageId === activity.messageId)))) {
+        baseline.progressed = true;
+      }
+    }
+    return baseline.progressed;
+  }
+
   /**
    * The newest rendered user message, once this document has watched ChatGPT generate for a
    * whole settle window without any turn — local or app-side — owning that generation.
@@ -1749,9 +1781,8 @@
     // fresh document with no local generation. Only the latest turn can veto:
     // an older answer must not hide the new question that follows it.
     const latest = observedTurns.at(-1);
+    const nativeFinal = latest?.role === 'assistant' && fiberTurnFor(latest)?.endMessageId;
     if (
-      !nowGenerating ||
-      (latest?.role === 'assistant' && fiberTurnFor(latest)?.endMessageId) ||
       generating ||
       genCount > 0 ||
       turnId ||
@@ -1760,6 +1791,7 @@
       commandAttempt
     ) {
       unrecordedGeneratingSince = 0;
+      unrecordedGenerationBaseline = null;
       return null;
     }
     let newest = null;
@@ -1771,13 +1803,18 @@
     // minted a turn with no work that stalled, earned another reload and hid the dead turn from
     // the automatic Continue (measured 2026-09-26, three rounds in 41 minutes).
     //
-    // A genuine regeneration of that same question — ChatGPT's own Retry after a lost stream —
-    // is different: its Stop stays, with no failure banner, for as long as it writes. That
-    // is how a Compact & Resume brief is rewritten after "Resume stream unavailable", and
-    // refusing it left the rewritten brief unrecorded. So the settled question needs a clean
-    // page and a much longer settle than an unrecorded question does.
+    // Retry can genuinely rewrite the same question, including a Compact & Resume brief.
+    // A clean Stop is not proof: require new assistant output or native tool/thinking
+    // evidence observed after this document's history baseline, as well as the settle.
     const settled = newest === appSettledQuestionId;
-    if (!newest || newest === openedUserMessageId || (settled && CLF_DOM.errors().length > 0)) {
+    const failed = settled && CLF_DOM.errors().length > 0;
+    if (!newest || newest === openedUserMessageId) {
+      unrecordedGeneratingSince = 0;
+      unrecordedGenerationBaseline = null;
+      return null;
+    }
+    const progressed = settled && settledGenerationProgress(newest, observedTurns, nowGenerating && !nativeFinal && !failed);
+    if (!nowGenerating || nativeFinal || failed) {
       unrecordedGeneratingSince = 0;
       return null;
     }
@@ -1786,7 +1823,8 @@
       finalsBeforeUnrecorded = new Set(knownFinals);
       return null;
     }
-    return Date.now() - unrecordedGeneratingSince >= (settled ? SETTLED_REGENERATION_MS : TURN_SETTLE_MS) ? newest : null;
+    return (!settled || progressed) &&
+      Date.now() - unrecordedGeneratingSince >= (settled ? SETTLED_REGENERATION_MS : TURN_SETTLE_MS) ? newest : null;
   }
 
   /**
@@ -1970,6 +2008,7 @@
     // epoch already keeps local turn ids distinct across SPA route changes.
     genCount = 0;
     unrecordedGeneratingSince = 0;
+    unrecordedGenerationBaseline = null;
     seenMessages.clear();
     reportedConversationTitle = '';
     reportedModelSelection = '';

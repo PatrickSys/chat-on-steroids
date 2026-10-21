@@ -1592,6 +1592,50 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
     expect(worker.tabsCreate).not.toHaveBeenCalled();
     expect(successReceipts).toHaveLength(state === 'current' ? 1 : 0);
   });
+  it.each(['unattributed', 'assistant-error', 'silence', 'no-tab', 'compaction'].flatMap(reason =>
+    ['stable', 'navigation', 'document', 'progress'].map(change => ({ reason, change }))))(
+    'fences $reason reload after the awaited page status: $change', async ({ reason, change }) => {
+      let armed = false, handed = false, claimed = false, changed = false, receipts = 0;
+      let releaseStatus!: () => void, statusStarted!: () => void;
+      const statusPending = new Promise<void>(resolve => { releaseStatus = resolve; });
+      const statusReached = new Promise<void>(resolve => { statusStarted = resolve; });
+      const fetch = vi.fn(async (input: string) => {
+        const url = new URL(input);
+        if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+        if (url.pathname === '/repairs/claim') { claimed = true; return response(200, { allowed: true }); }
+        if (url.pathname === '/status') {
+          if (url.searchParams.has('repaired')) receipts++;
+          if (armed && !handed) { handed = true; return response(200, { repairs: [{ conversationId: CHAT,
+            token: 'last-await', reason, requiresClaim: true, continueFollows: true }] }); }
+          return response(200, { repairs: [] });
+        }
+        return response(200, {});
+      });
+      const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch,
+        tabsQuery: async () => [{ id: 21, url: `https://chatgpt.com/c/${CHAT}` }],
+        tabsGet: async () => ({ id: 21, url: `https://chatgpt.com/c/${changed && change === 'navigation' ? OTHER : CHAT}` }),
+        tabsSendMessage: async (_id, message) => {
+          if ((message.type === 'clf-page-status' || message.type === 'clf-resume-compaction') && claimed) {
+            statusStarted(); await statusPending;
+            return undefined; // A genuinely dead page remains eligible for bounded recovery.
+          }
+          if (message.type !== 'clf-repair-check') return { ok: true };
+          return { safe: !(changed && change === 'progress'), revision: changed ? 2 : 1,
+            turnId: 'source', questionId: 'question' };
+        } });
+      await worker.registerTab(21);
+      await worker.send({ type: 'bind', conversationId: CHAT }, 21);
+      await worker.fireAlarm(); armed = true;
+      const repair = worker.fireAlarm();
+      await statusReached;
+      changed = change !== 'stable';
+      if (change === 'document') await worker.navigateTab(21, `https://chatgpt.com/c/${CHAT}`);
+      releaseStatus(); await repair; await worker.fireAlarm();
+      expect(worker.tabsReload).toHaveBeenCalledTimes(change === 'stable' ? 1 : 0);
+      if (change === 'stable') expect(worker.tabsReload).toHaveBeenCalledWith(21);
+      expect(worker.tabsCreate).not.toHaveBeenCalled();
+      expect(receipts).toBe(change === 'stable' ? 1 : 0);
+    });
 
   it.each([
     ['progress', 'changed-progress:app-progress'],
@@ -1674,7 +1718,7 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
       expect(repaired).toBe(reloads);
       expect(claimed).toBe(scenario !== 'draft-before-claim');
       expect(failed).toBe(scenario === 'draft-after-claim' || scenario === 'question-after-claim' ? 1 : 0);
-      expect(checks).toHaveLength(claimed ? 2 : 1);
+      expect(checks).toHaveLength(claimed ? (reloads ? 3 : 2) : 1);
       expect(checks.every(message => message.draftOnly === true)).toBe(true);
       if (claimed && scenario !== 'unresponsive') expect(checks[1]!.expected)
         .toEqual({ revision: 1, turnId: 'source', questionId: 'question' });

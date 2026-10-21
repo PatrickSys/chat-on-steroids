@@ -10986,10 +10986,28 @@ describe('a content script reloaded into a turn already in flight', () => {
     await live.hook.pullActivity();
     live.hook.observe();
     await settle();
-    live.advance(live.hook.TURN_SETTLE_MS * 2);
+    live.advance(35_000);
     live.hook.observe();
     await settle();
     await live.hook.flush();
+    expect(emitted(live.sent, 'turn_start')).toHaveLength(0);
+  });
+
+  it('does not reopen a settled question when unchanged historical DOM prose hydrates late', async () => {
+    live = await harness('https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      { activity: () => activity({ activeTurnId: null, userAnchors: [], settledQuestionId: 'm-turn-live-user' }) }, midTurn);
+    await live.hook.pullActivity();
+    live.hook.observe(); await settle();
+    live.advance(35_000);
+    const section = live.document.querySelector<HTMLElement>('[data-turn-id="turn-live"]')!;
+    prose(live.document, section, 'historical-response', 'The unchanged response from before the reload.');
+    live.hook.observe(); await settle(); await live.hook.flush();
+    expect(emitted(live.sent, 'turn_start')).toHaveLength(0);
+    // The first native snapshot confirms history; it does not certify a new generation.
+    await bindFiberTurns([{ section, turn: { turnId: 'turn-live', messages: [{
+      messageId: 'historical-response', rawMessageId: 'historical-response', stable: true,
+      rawText: 'The unchanged response from before the reload.' }] } }]);
+    live.hook.observe(); await settle(); await live.hook.flush();
     expect(emitted(live.sent, 'turn_start')).toHaveLength(0);
   });
 
@@ -10998,17 +11016,27 @@ describe('a content script reloaded into a turn already in flight', () => {
     // reload claimed a phantom turn for the dead question and cancelled its own Continue.
     ['Zeitüberschreitung bei der Übermittlung der Nachricht. Bitte versuche es erneut.', 0],
     ['Verbindung unterbrochen. Warten auf die vollständige Antwort.', 0]
-  ] as const)('treats a clean, lasting regeneration of the settled question as a turn (failure banner: %s)', async (banner, starts) => {
+  ] as const)('records fresh assistant progress for the settled question only without a failure banner: %s', async (banner, starts) => {
     // A Compact & Resume brief rewritten by ChatGPT's Retry after "Resume stream unavailable"
-    // is a real generation of the same question; a phantom shows the failure banner instead.
+    // is a real generation of the same question only when native output actually changes.
     live = await harness(
       'https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
       { activity: () => activity({ activeTurnId: null, userAnchors: [], settledQuestionId: 'm-turn-live-user' }) },
       midTurn
     );
     await live.hook.pullActivity();
+    const originalSection = live.document.querySelector<HTMLElement>('[data-turn-id="turn-live"]')!;
+    const original = { section: originalSection, turn: { turnId: 'turn-live',
+      activities: [{ messageId: 'original-thought', label: 'Reading content.js' }] } };
+    await bindFiberTurns([original]);
     if (banner) alertBanner(live.document, banner);
     for (let at = 0; at < 7; at++) {
+      if (at === 1) {
+        const section = assistantTurn(live.document, 'retry-answer', []);
+        prose(live.document, section, 'retry-message', 'Rewriting the brief.');
+        await bindFiberTurns([original, { section, turn: { turnId: 'retry-answer', messages: [{
+          messageId: 'retry-message', rawMessageId: 'retry-message', stable: true, rawText: 'Rewriting the brief.' }] } }]);
+      }
       live.hook.observe();
       await settle();
       live.advance(5_000);
@@ -11016,6 +11044,57 @@ describe('a content script reloaded into a turn already in flight', () => {
     live.hook.observe();
     await settle();
     await live.hook.flush();
+    expect(emitted(live.sent, 'turn_start')).toHaveLength(starts);
+  });
+
+  it.each(['text', 'thinking', 'tool'] as const)('recognizes the first Retry snapshot against the settled native view: %s', async evidence => {
+    live = await harness('https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      { activity: () => activity({ activeTurnId: null, userAnchors: [], settledQuestionId: 'm-turn-live-user' }) }, midTurn);
+    await live.hook.pullActivity();
+    stopGenerating(live.document);
+    const section = live.document.querySelector<HTMLElement>('[data-turn-id="turn-live"]')!;
+    await bindFiberTurns([{ section, turn: { turnId: 'turn-live', activities: [{ messageId: 'old-thought', label: 'Reading content.js' }] } }]);
+    live.hook.observe(); await settle();
+    // Retry starts, but the reader is unavailable until its first output has already arrived.
+    await bindFiberTurns([]);
+    startGenerating(live.document, { send: false });
+    live.hook.observe(); await settle(); live.advance(35_000);
+    await bindFiberTurns([{ section, turn: { turnId: 'turn-live',
+      ...(evidence === 'text' ? { messages: [{ messageId: 'first-retry-message', rawMessageId: 'first-retry-message', stable: true, rawText: 'The rewritten brief.' }] } : {}),
+      ...(evidence === 'thinking' ? { activities: [{ messageId: 'first-retry-thought', label: 'Checking the invariant' }] } : {}),
+      ...(evidence === 'tool' ? { calls: [{ messageId: 'first-retry-call', requestId: 'retry-request', tool: 'read' }] } : {})
+    } }]);
+    live.hook.observe(); await settle(); await live.hook.flush();
+    expect(emitted(live.sent, 'turn_start')).toHaveLength(1);
+    live.advance(5_000); live.hook.observe(); await settle(); await live.hook.flush();
+    expect(emitted(live.sent, 'turn_start')).toHaveLength(1);
+  });
+
+  it.each(['text', 'thinking', 'tool', 'label', 'metadata'] as const)('recognizes settled-question regeneration from fresh native %s evidence', async evidence => {
+    live = await harness('https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      { activity: () => activity({ activeTurnId: null, userAnchors: [], settledQuestionId: 'm-turn-live-user' }) }, midTurn);
+    await live.hook.pullActivity();
+    const section = live.document.querySelector<HTMLElement>('[data-turn-id="turn-live"]')!;
+    const descriptor = { turnId: 'turn-live', messages: [{ messageId: 'retry-text', rawMessageId: 'retry-text',
+      stable: true, rawText: 'Reading the source.', renderedHtml: '<p>Reading the source.</p>' }],
+      activities: [{ messageId: 'existing-thought', label: 'Reading the source' }], calls: [] };
+    await bindFiberTurns([{ section, turn: descriptor }]);
+    live.hook.observe(); await settle();
+    live.advance(35_000);
+    live.hook.observe(); await settle(); await live.hook.flush();
+    // The first snapshot, a repeated snapshot and Stop alone are history, even on a clean page.
+    expect(emitted(live.sent, 'turn_start')).toHaveLength(0);
+    await bindFiberTurns([{ section, turn: { ...descriptor,
+      ...(evidence === 'text' ? { messages: [{ ...descriptor.messages[0], rawText: 'Reading the source. Found the owner.' }] } : {}),
+      ...(evidence === 'thinking' ? { activities: [{ messageId: 'fresh-thought', label: 'Checking the invariant' }] } : {}),
+      ...(evidence === 'label' ? { activities: [{ messageId: 'existing-thought', label: 'Still reading the source' }] } : {}),
+      ...(evidence === 'metadata' ? { messages: [{ ...descriptor.messages[0], renderedHtml: '<p><strong>Reading the source.</strong></p>', createTime: 1700000000 }] } : {}),
+      ...(evidence === 'tool' ? { calls: [{ messageId: 'fresh-call', requestId: 'fresh-request', tool: 'read' }] } : {})
+    } }]);
+    live.hook.observe(); await settle(); await live.hook.flush();
+    const starts = evidence === 'label' || evidence === 'metadata' ? 0 : 1;
+    expect(emitted(live.sent, 'turn_start')).toHaveLength(starts);
+    live.advance(5_000); live.hook.observe(); await settle(); await live.hook.flush();
     expect(emitted(live.sent, 'turn_start')).toHaveLength(starts);
   });
 

@@ -214,6 +214,7 @@ define the tool/config/wire contract. README and worklogs are secondary and can 
 | Plugin auto-refresh | On. | Configs written before the setting existed read Off (schema default); conservative recovery also turns it off. While it is off and `ui.autoRefreshPluginsAsked` is not set, the window offers it once (`pluginRefresh:offer`); either answer sets `autoRefreshPluginsAsked`, which a settings save never clears. Local status/discovery never claims ChatGPT refreshed its connector snapshot. |
 | Turn-done notifications | On (`ui.turnNotifications`, missing means on). | Codex's turn-completion notification. `turn-notifications.ts` watches session changes and notifies once per newer `lastTurnEndAt` of a top-level chat whose outcome is `completed` and has no new active turn, while the window is unfocused. Seeded from the session list at startup, so older turns never notify. Workers, helpers, chats whose Goal/Loop switch is on, and chats that got a Session-finish or stuck notice in the last 2 minutes stay quiet. The body is the answer's first paragraph as plain text (140 characters); a click opens the chat. |
 | Fresh turns for long work | Every 30 minutes (`ui.rotateTurnMinutes`: 0 off, 20/30/45/60; missing or malformed means 30). | #1402. Measured: turns up to ~35 minutes ended cleanly, 37–64 minutes almost always broke; Stop + "continue" by hand never did. `turn-rotation.ts` `considerTurnRotation` runs on each attributed tool call (`noteCallAttribution`, after its `grantActivity`) for the chat's exact running turn. Once that turn's own `turn_start` is `rotateTurnMinutes` old, `input.ts` `fileRotationInput` files one `purpose: 'rotation'` direct-turn message (`rotationMessage()`, Core mention kept) into exactly that turn. The native send makes ChatGPT end the turn as interrupted and continue in a fresh one; the call in flight keeps its result. It must go in while that call still waits for its answer (#1662, measured 2026-10-18: 6/6 clean while a call ran; sent in the gap after a result ChatGPT sometimes queued it behind the reply, and a Stop during a call made the model run it again). So the kernel opens `rotation-hold.ts` `openCallHold` around recording an attributed call, rotation is considered only while `callHoldOpen`, and the bridge's `awaitRotationDelivery` holds the call's answer until the row is sent or settled; a row still unauthorized after 15 s is withdrawn (`withdrawUnsentRotation`, cancelled without an error) and the call answers. The page never stops a turn for it: offered no Send (ChatGPT shows only Stop at that moment), it sends nothing and reports `desktop_input` `fail` with `error` = `input.ts` `ROTATION_DECLINED` word for word and `detail: 'no-send'`; `failBrowserInput` cancels the row with that error, `rotationDelivery` answers `declined`, the held call answers at once, and `noteRotationDeclined` lets a tool result a minute later try again without spending one of the turn's two filings (at most six declines per turn; measured 2026-10-20 on Loop chats, where every continue fell on a Stop moment). Never for Pro, worker or helper chats, and never at the result of a Goal/Loop hold tool (`GOAL_HOLD_TOOLS`: `session_finish`, `keep_astra_on_forever`), which is Loop's next instruction. Goal and Loop chats rotate like any other (2.1.43): the rotated turn ends without a final answer, so no Goal/Loop decision is filed for it, and its continue is recorded with empty `authoredText`, which the Goal helper's transcript leaves out; never for a blocked chat, beside another pending message, or into a different turn. One per turn: a refused filing retries after 1 minute, one the page did not take after 5. A rotation row is not `manualInput`: a page that cannot take it during the turn drops it rather than keeping it for after the turn, and the timeline raises no delivery notice for it. A message of the user's own cancels a rotation that was never handed out. |
+| Stop fallback for fresh turns | Off (`ui.rotateStopFallback`, experimental; disabled while fresh turns are off). | Where ChatGPT shows only Stop at a tool result it offers no Send for the continue (`ROTATION_DECLINED`, `no-send`). After `STOP_FALLBACK_AFTER_DECLINES` (2) such declines in one turn and the usual minute, the next held result takes the fallback instead of a third continue (`stopFallbackDue`/`noteStopFallback`, once per turn): `rotation-fence.ts` arms a fence (the kernel refuses that chat's calls with `ROTATION_FENCE_REFUSAL`, nothing runs, so a Stop landing mid-call cannot repeat a call, #1662), and 500 ms later `stopSessionTurn(…, { rotation: true })` queues the native Stop without turning Goal/Loop off or cancelling Compact & Resume. The stopped end of exactly that turn lifts the fence and files `fileRotationContinueAfterStop`: a `purpose: 'rotation'`, `afterStop: true` ordinary message (no `directTurn`), which `typedAfterStop` lets through once the turn shows stopped and nothing runs. The fence lifts after 60 s without a stopped end. Live 2026-10-20 (VM): Stop 1 s after a result, then "continue", repeated no step (2 runs). |
 | Follow-up behavior | Join the running turn (`ui.followUp: 'steer'`; a broken value loads as that). | Codex's "Follow-up behavior". Each running turn starts the composer's delivery choice from this default (`queue` selects After this turn); a choice made in the send menu lasts for that turn. Cmd/Ctrl+Shift+Enter sends the other way (`sendComposer('auto' \| 'after-turn')`); with no running turn it is an ordinary send. |
 | Enter key | Enter sends (`ui.enterSends`, missing means true). | Codex's "Enter key behavior". With `false`, Enter adds a line in the composer and Cmd/Ctrl+Enter sends; Shift+Enter always adds a line and Cmd/Ctrl+Shift+Enter keeps sending the other way (Follow-up behavior). |
 | Keep awake | The computer (`ui.keepAwake` on, missing means on; `ui.keepScreenAwake` off). | Codex's "Prevent sleep while running". One select: Off / The computer / The computer and screen. `keep-awake.ts` holds `powerSaveBlocker` (`prevent-app-suspension`: the system stays awake, the screen may sleep; with `keepScreenAwake`, `prevent-display-sleep`, because Windows Modern Standby laptops go to standby once the screen turns off whatever else is held, and the hold is swapped when the choice changes) while any session is working by `sessionWorkingAt` with the bridge's `sessionActivityExpiresAt` deadline, so a chat that died mid-turn releases it when its deadline passes. Refreshed on session changes, at the nearest deadline, every 60 s and when the setting changes. |
@@ -1083,6 +1084,14 @@ row says so ("Creating this project in ChatGPT…", or the unavailable line poin
 deleted Project's page redirects to ChatGPT's home and drops the marker: the worker reports
 `gone` for the tab it opened for that Project, the link becomes `failed`, and nothing is sent.
 An opening remembers its Project, so a retry's new Project gets its own tab.
+A chat the person starts on chatgpt.com inside a linked Project joins that CoS project (#1744):
+the service worker's `events` handler reads the recording tab's URL (`tabChatgptProject`: the
+chat's own Project route, or the Project home only for a fresh chat's first, still unnamed
+observations; never a tab on another chat)
+and journals it as `chatgptProject`; `/events` sends it, and `bindChatToLinkedProject` binds a chat
+that has no project, is no worker or helper, has learned no workspace, and matches exactly one
+listed linked project. Worker-labelled batches never bind. Tests: `test/projects.test.ts`,
+`test/bridge.test.ts` and `test/extension.test.ts` (#1744).
 
 Branch in new chat (#482): the answer action under a completed reply with native ids (not in worker
 or helper chats) starts a new chat whose first message carries `branch { sessionId, conversationId,
@@ -1115,6 +1124,15 @@ turn (copied branch history, an adopted chat's history, replies to messages type
 the same actions as a turn's answer (`messageAnswerAnchors`); `sessions:exportMarkdown` names them
 by `messageId` instead of `turnId`, and refuses a turn's own answer named that way. `scope: 'latest'` names
 no answer: main picks the newest one that offers these actions (`latestAnswer`), a completed turn's or a turnless one.
+
+
+Bookmarked answers (#1719): `sessions:bookmarks { id }` → `SessionBookmark[]` (oldest answer first)
+and `sessions:bookmark { id, messageId, excerpt, messageTime, on }` → the chat's new list, in
+`src/main/session/bookmarks.ts`, kept in `bookmarks.json` in the session's folder and written serially per
+session; at most `MAX_BOOKMARKS` (200) per chat, excerpts one line of at most 160 characters. A
+missing or damaged file reads as no bookmarks; damaged entries are dropped. Nothing is sent to
+ChatGPT. The header list jumps through `sessions:locate-message`; a reply no longer in the chat
+shows a notice instead of scrolling. Long row menus scroll inside the window (`row-menu.ts`). A file holding more than the limit keeps the ones bookmarked first. Tests: `test/session-bookmarks.test.ts` (storage, limit, damaged files), the "bookmarked answers" cases in `test/renderer-timeline.test.ts` (answer action, header list, jump), and `scripts/verify-bookmark-list.cjs` (200 bookmarks in a short window, real Electron).
 
 Edit & resubmit (#365): ChatGPT keeps an edited question as a new version beside the old one, under
 the same parent, and continues from the new one. The page reports each question's place in that tree
@@ -3857,6 +3875,10 @@ This condition does not change ordinary Goal mode or user-message delivery.
 An enabled Loop records one `loop-stalled:<turnId>` progress explanation when an exact completed
 final lacks that tool-call proof. Active turns and explicit reactivation do not produce it;
 the note grants no decision, transport or retry authority and does not change finish-only timing.
+`acceptGoalReplyNow` serializes acceptance per conversation. For this no-tool diagnostic, the
+recorder re-offers an eligible final only after its exact source turn completes; acceptance defers
+the handled tombstone while that turn is still running. Diagnostic write failure logs a warning
+and leaves reply acceptance intact.
 Automatic tickets retain exact source ownership. Native busy uses the shared one/five-minute
 wait and one Stop claim; uncollected tickets use the shared bounded three-reload 2/5/10 pickup schedule (§14).
 A chat that started its own workers defers that pickup and the automatic decision
@@ -3964,10 +3986,18 @@ bounded receipt journal distinguishes pre-send busy cancellation from successful
 lost deferral response cannot resurrect the old text. App/web name this wait explicitly.
 
 Goal/Loop/planner failures retain machine codes for retry/ownership but publish a separate readable
-explanation in app and browser. Missing MCP evidence explains that the previous response made no
-local tool call, so lost tool connectivity cannot be established; Loop remains enabled. Do not
+explanation in app and browser. Missing MCP evidence reports that no local tool call was recorded
+for this reply: Loop did not continue. Answer any question, or check the tool connection; Loop
+stays on. Missing evidence cannot establish lost tool connectivity. Do not
 claim login is missing or the tunnel is off without evidence. Distinguish input size, helper output
 size, provider failures and uncertain delivery. Browser error text wraps instead of truncating.
+
+The `Review Goal completion` setting is off by default. When enabled, a Goal helper reporting
+completion without proof is shown as unverified. For an ordinary Goal reply, keep the reply
+pending without retrying. At Session finish, keep the existing hold active, ask the model to keep
+the turn open, and try to show one notice; record the event as `helper_stop_unverified`.
+Missing/false keeps the prior behavior, and Loop's refusal handling is unchanged. The optional
+progress `reason` labels this event; it does not prove the Goal is complete.
 
 Provider progress updates one existing timeline row and is never sendable text. Validate the
 final bounded decision schema before publication. Goal may return stop/no reply. Loop requires
@@ -4134,6 +4164,20 @@ unpinned groups and a drag never crosses between them. Only recorded chats are p
 workers or unattributed activity. Pinned rows carry a quiet pin mark at rest (it makes way for the
 row's "⋯" on hover, focus or while its menu is open), and Pin chat/Unpin chat is the first item of
 the chat's row menu, keeping keyboard focus on the rebuilt row's menu button.
+Chat groups (#1038) are named groups inside a project, one level deep, for sorting its chats; they
+never change a chat's project, folder, permissions or anything a tool call sees. `main/chat-groups.ts`
+keeps them in the durable store `chat-groups` (`{ version: 1, groups: [{ id, projectId, name,
+createdAt }], members: { sessionId: groupId } }`; names trimmed and folded, 1–60 characters; up to
+100 groups per project and 5000 grouped chats; a corrupt store starts empty). IPC `chatGroups:get`,
+`chatGroups:create` (project must exist and not be removed; returns `{ group, state }`),
+`chatGroups:rename`, `chatGroups:delete` (its chats stay in the project, ungrouped) and
+`chatGroups:assign { sessionId, groupId | null }` (only a non-worker chat of the group's own project);
+deleting a chat forgets its membership. A membership counts only while its chat is a non-worker chat
+of the group's project (`chatGroupOf`). The sidebar draws a project's groups first, ordered with the
+drag scope `groups:<projectId>`, each with its chats in scope `group:<groupId>` (pinned first, paged
+like the project), then the project's ungrouped chats. A group holding the open chat shows open.
+Project menu: New group; chat menu: Move to group (this project's groups, New group…) and Remove
+from group. Names use the shared in-app dialog `renderer/name-dialog.ts`.
 The worker drawer is a read-only split view of the selected worker's own recorded conversation;
 opening it never switches the prime composer. Its cards show the scoped worker id, task, observed
 current-conversation model and broker status when known, falling back to recorded session activity.
@@ -5126,6 +5170,8 @@ its indexes/geometry. Late proof aliases a request's state only to its own sessi
 unresolved requests cannot borrow observations. Headerless calls retain a separate legacy
 anonymous context; opting out refuses indexed/coordinate input without exact identity.
 Explicit activation consumes observation state too; ordinary input already activates its target.
+Apps `launch_app` starts on Windows are the helper's child processes, so a retired helper (timeout,
+crash, quit) ends only itself (`terminateProcess`), never its tree; `test/computer-helper-retirement.test.ts`.
 Late observations and replaced principals cannot lend another call their state.
 Single-window capture includes the cursor only when ScreenCaptureKit reports the window on
 screen: requesting the current desktop cursor for an off-Space window fails with -3811.

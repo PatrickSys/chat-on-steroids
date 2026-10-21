@@ -159,7 +159,7 @@ it('keeps another chat advance when acceptance persistence fails and accepts the
   } finally { fail(); await rejected; spy.mockRestore(); }
 });
 
-it.each(['null', 'throw'] as const)('accepts a completed Loop reply when diagnostic recording returns %s', async failure => {
+it.each(['null', 'throw', 'warn-throws'] as const)('accepts a completed Loop reply when diagnostic recording returns %s', async failure => {
   const conversationId = 'loop-diagnostic-failure';
   const session = await createSession({ conversationId });
   await goal.setGoalSwitchNow(conversationId, 'loop', true);
@@ -173,12 +173,52 @@ it.each(['null', 'throw'] as const)('accepts a completed Loop reply when diagnos
   if (failure === 'null') record.mockResolvedValue(null);
   else record.mockRejectedValue(new Error('record failed'));
   const warn = vi.spyOn(logger, 'logWarn');
+  if (failure === 'warn-throws') warn.mockImplementation(() => { throw new Error('debug output failed'); });
   try {
     await expect(goal.acceptGoalReplyNow({ conversationId, sessionId: session.id,
       replyId: 'stable-answer', turnId: 'completed-turn', eventSeq: 3, blocked: false })).resolves.toBeUndefined();
     expect(goal.snapshotGoalReplies().replies).toContainEqual(expect.objectContaining({ conversationId, state: 'handled' }));
     expect(warn).toHaveBeenCalled();
   } finally { record.mockRestore(); warn.mockRestore(); }
+});
+
+it.each(['goal', 'off'] as const)('preserves a %s policy change while the Loop diagnostic is pending', async mode => {
+  const conversationId = `loop-diagnostic-policy-${mode}`;
+  const session = await createSession({ conversationId });
+  await goal.setGoalSwitchNow(conversationId, 'loop', true);
+  await appendEvent(session.id, { source: 'extension', time: 1000, kind: 'turn_start', turnId: 'completed-turn' });
+  await appendEvent(session.id, { source: 'extension', time: 1200, kind: 'assistant_message', turnId: 'completed-turn',
+    messageId: 'stable-answer', final: true, message: { text: 'Checked.', chars: 8, truncated: false } });
+  await appendEvent(session.id, { source: 'extension', time: 1300, kind: 'turn_end', turnId: 'completed-turn', outcome: 'completed' });
+  const recorder = await import('../src/main/session/recorder.js');
+  const recordProgress = recorder.recordProgress;
+  let entered!: () => void, release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const record = vi.spyOn(recorder, 'recordProgress').mockImplementation(async (...args) => {
+    entered();
+    await gate;
+    return recordProgress(...args);
+  });
+  const input = { conversationId, sessionId: session.id, replyId: 'stable-answer',
+    turnId: 'completed-turn', eventSeq: 3, blocked: false };
+  const acceptance = goal.acceptGoalReplyNow(input);
+  try {
+    await started;
+    await goal.setGoalSwitchNow(conversationId, mode === 'goal' ? 'goal' : 'loop', mode === 'goal');
+    await goal.setGoalReplyActiveNow(conversationId, mode === 'goal');
+    release();
+    await acceptance;
+    await goal.acceptGoalReplyNow(input);
+    expect(goal.snapshotGoalReplies().replies).toContainEqual(expect.objectContaining({
+      conversationId, replyId: 'stable-answer', state: mode === 'goal' ? 'pending' : 'handled'
+    }));
+    expect(goal.goalPendingReplyFor(conversationId)?.replyId ?? null).toBe(mode === 'goal' ? 'stable-answer' : null);
+  } finally {
+    release();
+    await acceptance;
+    record.mockRestore();
+  }
 });
 
 it('records one Loop diagnostic for concurrent observations of the same completed reply', async () => {
@@ -1073,6 +1113,91 @@ describe('the reply', () => {
     expect((await settled('c-typed-owed')).stage).toBe('ready');
     // Only the page can type it; until it says it did, the turn is still owed.
     expect(goal.goalPendingReplyFor('c-typed-owed')).toMatchObject({ turnId: 'g-typed' });
+  });
+
+  describe('finishHoldOnStop (opt-in: a helper saying "done" is not verified completion)', () => {
+    const unverified = async (sessionId: string) => (await readRecentEvents(sessionId, 20))
+      .filter(event => 'reason' in event && event.reason === 'helper_stop_unverified');
+    const stopOnce = async (id: string, setting: boolean | undefined) => {
+      const config = (await import('../src/main/config.js')).getConfig();
+      await saveConfig({ ...config, ui: { ...config.ui, ...(setting === undefined ? {} : { finishHoldOnStop: setting }) } });
+      const sessionId = await seed(id);
+      await goal.acceptGoalReplyNow({ conversationId: id, sessionId, replyId: `assistant-${id}`, turnId: 'g-stop', eventSeq: 3, blocked: false });
+      let requests = 0;
+      globalThis.fetch = (async () => { requests += 1; return decision('stop'); }) as never;
+      goal.startGoalDraft({ sessionId, conversationId: id, turnId: 'g-stop' });
+      const view = await settled(id);
+      return { sessionId, view, requests };
+    };
+
+    it.each([undefined, false])('keeps the default completion behavior when the setting is %s', async setting => {
+      const { sessionId, view, requests } = await stopOnce(`c-stop-default-${setting}`, setting);
+      expect(view).toMatchObject({ stage: 'no-reply', error: null, reply: '', retryable: false });
+      expect(goal.goalPendingReplyFor(`c-stop-default-${setting}`)).toBeNull();
+      expect(await unverified(sessionId)).toEqual([]);
+      expect(requests).toBe(1);
+    });
+
+    it('marks a helper stop as unverified, keeps the reply pending, and records it once', async () => {
+      const { sessionId, view, requests } = await stopOnce('c-stop-optin', true);
+      expect(view).toMatchObject({ stage: 'failed', error: 'goal_helper_stop_unverified', reply: '', retryable: false });
+      expect(view.message).toMatch(/has not been checked/);
+      expect(goal.goalPendingReplyFor('c-stop-optin')).toMatchObject({ turnId: 'g-stop' });
+      expect(await unverified(sessionId)).toHaveLength(1);
+      expect(requests, 'no automatic continuation or retry was started').toBe(1);
+    });
+
+    it('discards an unverified stop retired while its exact source is being resolved', async () => {
+      const config = (await import('../src/main/config.js')).getConfig();
+      await saveConfig({ ...config, ui: { ...config.ui, finishHoldOnStop: true } });
+      const id = 'c-stop-retired-source';
+      const sessionId = await seed(id);
+      await appendEvent(sessionId, { time: 2000, source: 'extension', kind: 'assistant_message',
+        messageId: 'stop-source', turnId: 'source-turn', final: true,
+        message: { text: 'Done', chars: 4, truncated: false } });
+      await goal.acceptGoalReplyNow({ conversationId: id, sessionId, replyId: 'stop-source',
+        turnId: 'reply:stop-source', eventSeq: 2, blocked: false });
+      const store = await import('../src/main/session/store.js');
+      const read = store.readRecentEvents;
+      let entered!: () => void, resume!: () => void;
+      const waiting = new Promise<void>(resolve => { entered = resolve; });
+      const gate = new Promise<void>(resolve => { resume = resolve; });
+      const lookup = vi.spyOn(store, 'readRecentEvents').mockImplementation(async (...args) => {
+        const events = await read(...args);
+        if (args[2]?.kinds?.length === 1 && args[2].kinds[0] === 'assistant_message') {
+          entered();
+          await gate;
+        }
+        return events;
+      });
+      const recorder = await import('../src/main/session/recorder.js');
+      const progress = vi.spyOn(recorder, 'recordProgress').mockResolvedValue({ seq: 3, time: 3000 });
+      try {
+        globalThis.fetch = (async () => decision('stop')) as never;
+        goal.startGoalDraft({ sessionId, conversationId: id, turnId: 'reply:stop-source' });
+        await waiting;
+        expect(goal.retireGoalDraftsFor(id)).toBe(true);
+        resume();
+        await new Promise<void>(resolve => setImmediate(resolve));
+        expect(progress).not.toHaveBeenCalled();
+        expect(await unverified(sessionId)).toEqual([]);
+        expect(goal.goalViewFor(id)).toBeNull();
+        expect(goal.goalPendingReplyFor(id)).toBeNull();
+      } finally { resume(); lookup.mockRestore(); progress.mockRestore(); }
+    });
+
+    it('reports an unrecorded helper stop without retrying or consuming the reply', async () => {
+      const recorder = await import('../src/main/session/recorder.js');
+      const logger = await import('../src/main/logger.js');
+      const progress = vi.spyOn(recorder, 'recordProgress').mockResolvedValue(null);
+      const warning = vi.spyOn(logger, 'logWarn');
+      try {
+        const { view } = await stopOnce('c-stop-record-failed', true);
+        expect(view).toMatchObject({ stage: 'failed', error: 'goal_helper_stop_unverified', retryable: false });
+        expect(goal.goalPendingReplyFor('c-stop-record-failed')).not.toBeNull();
+        expect(warning).toHaveBeenCalledWith(expect.stringContaining('unverified stop could not be recorded'));
+      } finally { progress.mockRestore(); warning.mockRestore(); }
+    });
   });
 
   it('reports no outcome for a typed continuation the page has acted on', async () => {

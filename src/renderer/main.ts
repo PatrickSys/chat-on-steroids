@@ -739,9 +739,11 @@ function save(over: { readOnly?: boolean; theme?: 'light' | 'dark'; appearance?:
       chatBrowser: $<HTMLSelectElement>('chatBrowser').value as ChatBrowser,
       cosBrowserMinimize: $<HTMLSelectElement>('cosBrowserMinimize').value === 'tray' ? 'tray' : 'taskbar',
       finishTool: $<HTMLInputElement>('finishTool').checked,
+      finishHoldOnStop: $<HTMLInputElement>('finishHoldOnStop').checked,
       planBackend: $<HTMLSelectElement>('planBackend').value as 'chatgpt' | 'api',
       finishLeadMinutes: Number($<HTMLSelectElement>('finishLeadMinutes').value),
       rotateTurnMinutes: Number($<HTMLSelectElement>('rotateTurnMinutes').value),
+      rotateStopFallback: $<HTMLInputElement>('rotateStopFallback').checked,
       backgroundChats: $<HTMLInputElement>('backgroundChats').checked,
       backgroundPlacement: $<HTMLSelectElement>('backgroundPlacement').value === 'group' ? 'group' : 'window',
       followUp: $<HTMLSelectElement>('followUp').value === 'queue' ? 'queue' : 'steer',
@@ -1662,6 +1664,7 @@ function apply(next: AppState): void {
   $('cosBrowserMinimizeRow').hidden = (config.ui.chatBrowser ?? 'chrome') !== 'cos';
   $<HTMLSelectElement>('planBackend').value = config.ui.planBackend ?? 'chatgpt';
   applyChecked($<HTMLInputElement>('finishTool'), config.ui.finishTool === true, previousState?.config.ui.finishTool);
+  applyChecked($<HTMLInputElement>('finishHoldOnStop'), config.ui.finishHoldOnStop === true, previousState?.config.ui.finishHoldOnStop);
   applyValue($<HTMLSelectElement>('finishLeadMinutes'), String(config.ui.finishLeadMinutes ?? 5), String(previousState?.config.ui.finishLeadMinutes ?? 5));
   $<HTMLSelectElement>('finishLeadMinutes').disabled = config.ui.finishTool !== true;
   // A value the list does not offer (set in the config) gets its own option; without one the select
@@ -1675,6 +1678,8 @@ function apply(next: AppState): void {
     rotate.add(option);
   }
   applyValue(rotate, rotateMinutes, previousState ? String(previousState.config.ui.rotateTurnMinutes ?? 30) : undefined);
+  applyChecked($<HTMLInputElement>('rotateStopFallback'), config.ui.rotateStopFallback === true, previousState?.config.ui.rotateStopFallback);
+  $<HTMLInputElement>('rotateStopFallback').disabled = (config.ui.rotateTurnMinutes ?? 30) === 0;
   applyChecked($<HTMLInputElement>('backgroundChats'), config.ui.backgroundChats === true, previousState?.config.ui.backgroundChats);
   applyValue($<HTMLSelectElement>('backgroundPlacement'), config.ui.backgroundPlacement ?? 'window', previousState?.config.ui.backgroundPlacement ?? 'window');
   applyValue($<HTMLSelectElement>('followUp'), config.ui.followUp ?? 'steer', previousState?.config.ui.followUp ?? 'steer');
@@ -1710,6 +1715,12 @@ function apply(next: AppState): void {
   applyChecked($<HTMLInputElement>('mcpPersistentUrls'), config.mcp?.persistentUrls === true, previousState?.config.mcp?.persistentUrls);
   // Stable URLs live only in the OS-backed secret store; without it they keep rotating.
   $<HTMLInputElement>('mcpPersistentUrls').disabled = next.secureStorage?.available === false && config.mcp?.persistentUrls !== true;
+  // Another program held the kept port at this start: the tunnel must follow the new one.
+  const moved = config.mcp?.persistentUrls === true ? next.status.keptPortMoved ?? null : null;
+  $('mcpPortMoved').hidden = moved === null;
+  ui($('mcpPortMoved'), 'textContent', () => moved
+    ? t('Port {0} was in use when the app started, so it now listens on port {1}. Point your tunnel at port {1}.', [moved.from, moved.to])
+    : '');
   applyChecked($<HTMLInputElement>('controlApiAllowActions'), config.controlApi?.allowActions === true, previousState?.config.controlApi?.allowActions);
   // Actions need the API itself, so the switch stays off and disabled until it is on.
   $<HTMLInputElement>('controlApiAllowActions').disabled = config.controlApi?.enabled !== true;

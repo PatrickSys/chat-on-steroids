@@ -1,5 +1,7 @@
 import { hasProviderDirective, resolvedCapture, withoutProviderDirectives } from '../shared/content-reference.js';
 import { completedDilText } from '../shared/dil-tables.js';
+import { markdownVisibleText } from '../shared/markdown-text.js';
+import { providerEntitiesAsMarkdown } from '../shared/content-reference.js';
 import { initChatSearch, type ChatSearch } from './chat-search.js';
 import { initChatFind } from './chat-find.js';
 import { initChatCycle } from './chat-cycle.js';
@@ -12,6 +14,9 @@ import { applyChatModels, applyComposerSessionModel, initChatModels, confirmedCo
 import { marked, Marked, type TokenizerAndRendererExtension } from 'marked';
 import { safeExternalLink } from '../shared/external-link.js';
 import { AGENT_STATE_WORDS, createAgentPanel, workerName, workerSlotLimit } from './agent-panel.js';
+import type { ChatGroup, ChatGroupsState } from '../shared/chat-groups.js';
+import { chatGroupName, chatGroupOf } from '../shared/chat-groups.js';
+import { requestName } from './name-dialog.js';
 import { KIND_ICON } from './agent-activity.js';
 import { createFilePanel } from './file-panel.js';
 import { renderAgentPlan } from './agent-plan.js';
@@ -61,6 +66,7 @@ import type {
   Handoff,
   MessageReference,
   RunningToolActivity,
+  SessionBookmark,
   SessionChange,
   SessionEvent,
   SessionSearchLocation,
@@ -73,6 +79,7 @@ import type {
 } from '../shared/session.js';
 import {
   ATTRIBUTION_LABELS,
+  BOOKMARK_EXCERPT_MAX,
   CHAT_ACTIVE_MS,
   committedResumeAncestorsFromSummary,
   continuationMarkerOf,
@@ -96,7 +103,7 @@ import { browserExtensionRequired, type AppState, type Config } from '../shared/
 import { $, ago, clockTime, compactNumber, disclosureChevron, el, icon, run, setIcon, toast } from './dom.js';
 import { APPROVAL_ANSWERED_TEXT, APPROVAL_PROGRESS_PREFIX, APPROVAL_WAITING_TEXT, type ApprovalCardView } from '../shared/approval-wait.js';
 import { STRICT_REFUSAL_PROGRESS_PREFIX, UNPROVEN_WORKER_NOTICE, UNTRUSTED_NOTICE, UNTRUSTED_WORKER_NOTICE } from '../shared/trust-notices.js';
-import { openRowMenu, rowMenuOpenFor, toggleRowMenu, type RowMenuItem, type RowMenuOptions } from './row-menu.js';
+import { closeRowMenu, onRowMenuChange, openRowMenu, rowMenuOpenFor, toggleRowMenu, type RowMenuItem, type RowMenuOptions } from './row-menu.js';
 import { createSearchPopup } from './search-popup.js';
 import { primaryShortcut } from './shortcuts.js';
 import { initSshProjectDialog } from './ssh-project-dialog.js';
@@ -169,6 +176,85 @@ const NATIVE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
 let projects: LocalProject[] = [];
 /** Window-local disclosure intent. Project groups start closed until the user or selection opens one. */
 const expandedProjects = new Set<string>();
+/** Chat groups inside projects (#1038): loaded once, replaced by every change's reply. */
+let chatGroups: ChatGroupsState = { version: 1, groups: [], members: {} };
+/** Groups the person closed; a new group, or one holding the open chat, shows open. */
+const collapsedGroups = new Set<string>();
+const groupVisibleCounts = new Map<string, number>();
+/** A chat group's drag scope among its project's groups, and the scope of its own chats. */
+const chatGroupsScope = (projectId: string): string => `groups:${projectId}`;
+const chatGroupScope = (groupId: string): string => `group:${groupId}`;
+
+/** A project's groups, in the order the person gave them. */
+function projectChatGroups(projectId: string): ChatGroup[] {
+  const groups = chatGroups.groups.filter(group => group.projectId === projectId);
+  return sidebarOrder ? sidebarOrder.ordered(chatGroupsScope(projectId), groups) : groups;
+}
+
+/** The sidebar list a chat sorts in: its group, its project, or the main list (''). */
+function chatSortList(entry: SessionSummary): string {
+  const group = chatGroupOf(chatGroups, entry);
+  return group && projectGroup(entry.projectId) === group.projectId ? chatGroupScope(group.id) : projectGroup(entry.projectId) ?? '';
+}
+
+async function applyChatGroups(reply: Promise<{ ok: true; data: ChatGroupsState } | { ok: false; error: string }>): Promise<boolean> {
+  const next = await run(reply);
+  if (!next) return false;
+  chatGroups = next;
+  paintSessions();
+  return true;
+}
+
+function askChatGroupName(title: string, confirm: string, initial = ''): Promise<string | null> {
+  return requestName({
+    title, confirm, initial, maxLength: 240,
+    validate: value => chatGroupName(value) ? null : t('A group name needs 1 to 60 characters')
+  });
+}
+
+/** Asks for a name, creates the group in its project, opens it, and moves `sessionId` into it when given. */
+async function newChatGroup(projectId: string, sessionId: string | null = null): Promise<void> {
+  const name = await askChatGroupName(t('New group'), t('Create'));
+  if (!name) return;
+  const created = await run(api.createChatGroup(projectId, name));
+  if (!created) return;
+  chatGroups = created.state;
+  expandedProjects.add(projectId);
+  collapsedGroups.delete(created.group.id);
+  if (sessionId) await applyChatGroups(api.assignChatGroup(sessionId, created.group.id));
+  else paintSessions();
+}
+
+async function renameChatGroup(group: ChatGroup): Promise<void> {
+  const name = await askChatGroupName(t('Rename group'), t('Rename'), group.name);
+  if (name && chatGroupName(name) !== group.name) await applyChatGroups(api.renameChatGroup(group.id, name));
+}
+
+/** Removes a group; its chats stay in the project, ungrouped, and nothing about them changes. */
+async function deleteChatGroup(group: ChatGroup): Promise<void> {
+  if (await applyChatGroups(api.deleteChatGroup(group.id))) toast(t('Group deleted. Its chats stay in the project.'));
+}
+
+/** The chat menu's group items, for a main chat of a project. */
+function chatGroupMenuItems(summary: SessionSummary): RowMenuItem[] {
+  const projectId = projectGroup(summary.projectId);
+  if (!projectId || summary.origin?.kind === 'worker' || !summary.conversationId) return [];
+  const current = chatGroupOf(chatGroups, summary);
+  const groups = projectChatGroups(projectId);
+  return [{
+    action: 'move-to-group', icon: 'i-group', label: () => t('Move to group'), title: () => t('Sort this chat into a group of its project'),
+    submenu: () => [
+      ...groups.map(group => ({
+        action: `group-${group.id}`, checked: current?.id === group.id, label: () => group.name,
+        run: () => { if (current?.id !== group.id) void applyChatGroups(api.assignChatGroup(summary.id, group.id)); }
+      } satisfies RowMenuItem)),
+      { action: 'group-new', icon: 'i-plus', separated: groups.length > 0, label: () => t('New group…'), run: () => void newChatGroup(projectId, summary.id) }
+    ]
+  }, ...(current ? [{
+    action: 'remove-from-group', icon: 'i-x', label: () => t('Remove from group'), title: () => t('Keep this chat in its project without a group'),
+    run: () => void applyChatGroups(api.assignChatGroup(summary.id, null))
+  } satisfies RowMenuItem] : [])];
+}
 const projectVisibleCounts = new Map<string, number>();
 function projectGroup(id: string | null | undefined): string | null {
   return id && !projects.find(project => project.id === id)?.ungrouped ? id : null;
@@ -187,6 +273,8 @@ function projectMenuItems(id: string): RowMenuItem[] {
   const color = projects.find(row => row.id === id)?.color ?? null;
   const link = projects.find(row => row.id === id)?.chatgpt;
   return [
+    { action: 'group-new', icon: 'i-group', label: () => t('New group'), title: () => t('Add a group to sort this project\'s chats'),
+      run: () => void newChatGroup(id) },
     // Only when its native ChatGPT Project could not be created; otherwise nothing about it shows.
     ...(link?.state === 'failed' || link?.state === 'uncertain' ? [{
       action: 'chatgpt-retry', icon: 'i-retry', disabled: retryingChatgptProject.has(id),
@@ -1019,6 +1107,7 @@ function sessionRow(summary: SessionSummary): HTMLElement {
       { action: 'copy-link', icon: 'i-copy', label: () => t('Copy link'), title: () => t("Copy this chat's ChatGPT link"),
         run: async () => { if (await run(api.writeClipboard(`https://chatgpt.com/c/${summary.conversationId}`))) toast(t('Link copied')); } }
     );
+    items.push(...chatGroupMenuItems(summary));
     // The stop this app can actually make. It does not touch the running ChatGPT turn — nothing
     // here can — it takes this chat's tools away, and a model whose every call is refused with
     // an instruction to stop finishes its turn on its own.
@@ -1922,6 +2011,74 @@ function workerChildren(): Map<string, SessionSummary[]> {
  * A chat's sub-agents: the arrow that shows or hides them, on the chat's row (or alone in `target`),
  * and while they are expanded their rows after it. Both sidebar layouts draw them this way.
  */
+/** A main chat of a project as the sidebar lists it: the chat, its sub-agents, and whether it is the open one. */
+type ProjectTask = { entry: SessionSummary; workers?: SessionSummary[]; selected: boolean };
+
+/**
+ * One chat group in its project (#1038): a disclosure with its chats, paged like the project's own
+ * list. A group holding the open chat shows open whatever the person last chose for it.
+ */
+function chatGroupSection(group: ChatGroup, tasks: ProjectTask[]): HTMLElement {
+  const section = document.createElement('details'); section.className = 'chat-group'; section.dataset.groupId = group.id;
+  section.dataset.sortId = group.id; section.dataset.sortScope = chatGroupsScope(group.projectId);
+  const holdsSelected = tasks.some(task => task.selected);
+  section.open = holdsSelected || !collapsedGroups.has(group.id);
+  const heading = el('summary', 'chat-group-heading');
+  heading.dataset.sortHandle = '';
+  heading.setAttribute('aria-keyshortcuts', 'Alt+ArrowUp Alt+ArrowDown');
+  const name = el('span', 'chat-group-name', group.name); name.dir = 'auto';
+  heading.append(icon('i-group'), name, el('span', 'chat-group-count', String(tasks.length)));
+  heading.title = group.name;
+  // Like a project's disclosure: committed synchronously, so an activity repaint cannot lose the click.
+  heading.addEventListener('click', event => {
+    event.preventDefault();
+    const open = collapsedGroups.has(group.id);
+    if (open) collapsedGroups.delete(group.id); else collapsedGroups.add(group.id);
+    section.open = open || holdsSelected;
+  });
+  const owner = `group:${group.id}`;
+  const more = el('button', 'btn row-menu-button chat-group-menu') as HTMLButtonElement;
+  more.type = 'button'; more.dataset.rowMenu = owner; more.append(icon('i-more-vertical'));
+  more.setAttribute('aria-haspopup', 'menu'); more.setAttribute('aria-expanded', String(rowMenuOpenFor(owner)));
+  ui(more, 'title', () => t('More options'));
+  ui(more, 'aria-label', () => t('More options'));
+  const menu = (at?: { x: number; y: number }): RowMenuOptions => ({
+    owner, at, label: () => group.name, anchor: () => rowMenuButton(owner), items: () => [
+      { action: 'rename', icon: 'i-pencil', label: () => t('Rename'), title: () => t('Rename this group'), run: () => void renameChatGroup(group) },
+      { action: 'delete', icon: 'i-trash', danger: true, separated: true, label: () => t('Delete group'),
+        title: () => t('Delete this group; its chats stay in the project'), run: () => void deleteChatGroup(group) }
+    ]
+  });
+  more.addEventListener('click', event => { event.preventDefault(); event.stopPropagation(); toggleRowMenu(menu()); });
+  heading.addEventListener('contextmenu', event => { event.preventDefault(); openRowMenu(menu({ x: event.clientX, y: event.clientY })); });
+  heading.append(more);
+  section.append(heading);
+  // Pinned chats lead the group, then the person's own order within it.
+  const order = (pinned: boolean): ProjectTask[] => {
+    const members = tasks.filter(task => pinnedChat(task.entry) === pinned).map(task => ({ ...task, id: task.entry.id }));
+    return sidebarOrder ? sidebarOrder.ordered(pinnedSortScope(chatGroupScope(group.id), pinned), members) : members;
+  };
+  const ordered = [...order(true), ...order(false)];
+  const limit = groupVisibleCounts.get(group.id) ?? PROJECT_TASK_PAGE_SIZE;
+  const shown = ordered.filter((task, index) => index < limit || task.selected);
+  const rows: HTMLElement[] = [];
+  for (const task of shown) {
+    const row = sessionRow(task.entry);
+    row.dataset.sortScope = pinnedSortScope(chatGroupScope(group.id), pinnedChat(task.entry));
+    rows.push(row);
+    if (task.workers) workerGroup(task.entry.id, task.workers, row, rows);
+  }
+  section.append(...rows);
+  if (!tasks.length) section.append(el('p', 'chat-group-empty', () => t("Move a chat here from its menu.")));
+  if (shown.length < ordered.length) {
+    const showMore = el('button', 'btn project-show-more chat-group-show-more', () => t("Show more")) as HTMLButtonElement;
+    showMore.type = 'button'; ui(showMore, 'aria-label', () => t("Show more chats in {0}", [group.name]));
+    showMore.addEventListener('click', () => { groupVisibleCounts.set(group.id, limit + PROJECT_TASK_PAGE_INCREMENT); paintSessions(); });
+    section.append(showMore);
+  }
+  return section;
+}
+
 function workerGroup(key: string, workers: SessionSummary[], parentRow: HTMLElement | undefined, target: HTMLElement[]): void {
   const button = el('button', 'worker-toggle');
   button.append(disclosureChevron());
@@ -1998,13 +2155,14 @@ function paintSessions(): void {
   // composer or settings. A keyboard user tabbing to a project's buttons lost focus to the
   // page on the next repaint, and so did the color button after a pick.
   const restoreFocus = sidebarFocus(projectList, 'data-project-id', ['.project-heading', '.project-new', '.project-menu', '.project-show-more']);
+  const restoreGroupFocus = sidebarFocus(projectList, 'data-group-id', ['.chat-group-heading', '.chat-group-menu', '.chat-group-show-more']);
   const children = workerChildren();
   const rows: HTMLElement[] = [];
   // A task and its expanded workers are one sidebar item for project pagination.
   // Store lightweight owners until the visible page is known. Creating DOM for
   // hundreds of older, off-page project tasks on every activity push stalls the renderer
   // even though those nodes are immediately discarded by the project page limit.
-  const projectRows = new Map<string, Array<{ entry: SessionSummary; workers?: SessionSummary[]; selected: boolean }>>();
+  const projectRows = new Map<string, ProjectTask[]>();
   const diagnostics: SessionSummary[] = [];
   // Pinned chats lead their own list (#1133). Resolve project membership once for
   // this paint: scanning all sessions for each project and then searching the project
@@ -2088,7 +2246,16 @@ function paintSessions(): void {
       create.addEventListener('click', event => { event.preventDefault(); event.stopPropagation(); selectNewChat(id); });
       heading.append(create, more);
     }
-    const tasks = projectRows.get(id) ?? [];
+    // The project's chat groups lead its list (#1038); each holds its own chats, in its own order.
+    const tasks: ProjectTask[] = [];
+    const groupedTasks = new Map<string, ProjectTask[]>();
+    for (const task of projectRows.get(id) ?? []) {
+      const group = chatGroupOf(chatGroups, task.entry);
+      if (!group || group.projectId !== id) { tasks.push(task); continue; }
+      const members = groupedTasks.get(group.id);
+      if (members) members.push(task); else groupedTasks.set(group.id, [task]);
+    }
+    for (const group of projectChatGroups(id)) section.append(chatGroupSection(group, groupedTasks.get(group.id) ?? []));
     const count = projectVisibleCounts.get(id) ?? PROJECT_TASK_PAGE_SIZE;
     const shown = tasks.filter((task, index) => index < count || task.selected);
     const shownRows: HTMLElement[] = [];
@@ -2147,6 +2314,7 @@ function paintSessions(): void {
     }
   }
   restoreFocus();
+  restoreGroupFocus();
   syncSelectedWorkspace();
   $('projectsEmpty').hidden = projectSections.length > 0;
   $('sessionsEmpty').hidden = rows.length > 0;
@@ -2167,6 +2335,7 @@ function syncSelectedWorkspace(): void {
   // Branch in new chat and Edit: the composer notices and the link back follow the selection in either layout.
   paintBranchNotices();
   paintEditNotice();
+  syncBookmarks();
 }
 
 /**
@@ -2400,6 +2569,107 @@ function laterMessageCounts(items: readonly TimelineItem[]): Map<number, number>
 function olderHistoryPending(): boolean {
   const oldest = events.reduce((least, event) => Math.min(least, residenceOf(event)), Infinity);
   return Number.isFinite(oldest) && oldest > 1 && oldest !== historyStart;
+}
+
+/**
+ * Bookmarked answers of the open chat: marked with the bookmark under an answer, listed by the
+ * header's bookmark button to jump back to them. Kept by main in the chat's own folder.
+ */
+let bookmarks: { sessionId: string; marks: SessionBookmark[] } | null = null;
+let bookmarksLoading: string | null = null;
+
+function bookmarked(sessionId: string, messageId: string): boolean {
+  return bookmarks?.sessionId === sessionId && bookmarks.marks.some(mark => mark.messageId === messageId.toLowerCase());
+}
+
+/** The answer's start as one plain line, as its bookmark is listed; cut here so a long one is still accepted. */
+function bookmarkExcerpt(text: string): string {
+  const line = markdownVisibleText(providerEntitiesAsMarkdown(withoutMessageReaction(text)), { codeBlocks: false })
+    .split(/\n\s*\n/).map(part => part.replace(/\s+/g, ' ').trim()).find(Boolean) ?? '';
+  // A cut never leaves half of an emoji (a lone high surrogate) before the ellipsis.
+  return line.length <= BOOKMARK_EXCERPT_MAX ? line : `${line.slice(0, BOOKMARK_EXCERPT_MAX - 1).replace(/[\uD800-\uDBFF]$/, '').trimEnd()}…`;
+}
+
+function bookmarkButton(sessionId: string, messageId: string, answer: { text: string; time: number }): HTMLButtonElement {
+  const button = el('button', 'answer-action answer-bookmark') as HTMLButtonElement;
+  button.type = 'button';
+  button.dataset.bookmarkFor = messageId.toLowerCase();
+  button.append(icon('i-bookmark'));
+  paintBookmarkButton(button, bookmarked(sessionId, messageId));
+  button.addEventListener('click', async () => {
+    if (selectedId !== sessionId || button.dataset.busy) return;
+    const on = !bookmarked(sessionId, messageId);
+    button.dataset.busy = 'true';
+    try {
+      const marks = await run(api.setBookmark(sessionId, messageId, bookmarkExcerpt(answer.text) || t('Answer'), answer.time, on));
+      if (Array.isArray(marks) && selectedId === sessionId) { bookmarks = { sessionId, marks }; paintBookmarks(); }
+    } finally { delete button.dataset.busy; }
+  });
+  return button;
+}
+
+function paintBookmarkButton(button: HTMLElement, on: boolean): void {
+  if (button.classList.contains('is-on') === on && button.dataset.painted) return;
+  button.dataset.painted = 'true';
+  button.classList.toggle('is-on', on);
+  button.setAttribute('aria-pressed', String(on));
+  setIcon(button.querySelector<HTMLElement>('i')!, on ? 'i-bookmark-fill' : 'i-bookmark');
+  const label = () => on ? t('Remove bookmark') : t('Bookmark answer');
+  ui(button, 'title', label); ui(button, 'aria-label', label);
+}
+
+/** Loads the open chat's bookmarks each time it is opened, then paints them. */
+function syncBookmarks(): void {
+  const id = !newChatSelected ? selectedId : null;
+  if (bookmarks && bookmarks.sessionId !== id) bookmarks = null;
+  if (!id) { paintBookmarks(); return; }
+  if (bookmarks?.sessionId === id || bookmarksLoading === id) { paintBookmarks(); return; }
+  bookmarksLoading = id;
+  paintBookmarks();
+  void Promise.resolve(api.listBookmarks(id)).catch(() => null).then(result => {
+    if (bookmarksLoading === id) bookmarksLoading = null;
+    if (selectedId !== id) return;
+    // An unreadable list shows no marks; the answers still offer theirs.
+    bookmarks = { sessionId: id, marks: result?.ok && Array.isArray(result.data) ? result.data : [] };
+    paintBookmarks();
+  });
+}
+
+/** The header's bookmark button and every answer's bookmark, for the open chat. */
+function paintBookmarks(): void {
+  const id = !newChatSelected ? selectedId : null;
+  const marks = id && bookmarks?.sessionId === id ? bookmarks.marks : [];
+  const button = $<HTMLButtonElement>('chatBookmarks');
+  button.hidden = marks.length === 0;
+  button.querySelector('.chat-bookmarks-count')!.textContent = String(marks.length);
+  const label = () => tn('{0} bookmark in this chat', '{0} bookmarks in this chat', marks.length);
+  ui(button, 'title', label); ui(button, 'aria-label', label);
+  if (!marks.length && rowMenuOpenFor('bookmarks')) closeRowMenu();
+  for (const answer of $('timeline').querySelectorAll<HTMLElement>('.answer-bookmark[data-bookmark-for]'))
+    paintBookmarkButton(answer, marks.some(mark => mark.messageId === answer.dataset.bookmarkFor));
+}
+
+function bookmarkMenuItems(): RowMenuItem[] {
+  const id = selectedId;
+  if (!id || bookmarks?.sessionId !== id) return [];
+  return bookmarks.marks.map(mark => ({
+    action: 'bookmark',
+    icon: 'i-bookmark-fill',
+    label: () => mark.excerpt || t('Answer'),
+    title: () => mark.excerpt,
+    hint: () => clockTime(mark.messageTime),
+    data: { bookmark: mark.messageId },
+    run: () => void openBookmark(id, mark.messageId)
+  }));
+}
+
+/** Scrolls the open chat to a bookmarked answer, loading the history around it when needed. */
+async function openBookmark(sessionId: string, messageId: string): Promise<void> {
+  const selection = selectionGeneration;
+  const location = await run(api.locateMessage(sessionId, messageId));
+  if (selection !== selectionGeneration || selectedId !== sessionId) return;
+  if (!location) { toast(t('This answer is no longer in the chat.')); return; }
+  await revealChatLocation(sessionId, location);
 }
 
 /** The Edit action under one of your questions. */
@@ -4579,6 +4849,10 @@ function eventBody(event: SessionEvent, context?: { id: string; current: () => b
     }
     case 'progress': {
       if (event.progressId?.startsWith('loop-stalled:')) return el('p', 'meta is-progress', () => loopStalledNoticeText(event.message.text));
+      if (event.source === 'app' && event.progressId?.startsWith('goal-helper-stop:') &&
+          event.message.text === goalErrorMessage('goal_helper_stop_unverified')) {
+        return el('p', 'meta is-progress', () => t(goalErrorMessage('goal_helper_stop_unverified')));
+      }
       if (event.progressId?.startsWith(STRICT_REFUSAL_PROGRESS_PREFIX)) return el('p', 'meta is-progress', () => trustNoticeText(event.message.text));
       if (!event.progressId?.startsWith(APPROVAL_PROGRESS_PREFIX)) return el('p', 'meta is-progress', event.message.text);
       // ChatGPT's own tool approval card stands in this chat's page (approval-wait.ts). The app
@@ -4694,7 +4968,7 @@ function eventBody(event: SessionEvent, context?: { id: string; current: () => b
  * builds the text from the log, reading back answers that were cut there, so a long answer
  * copies and exports whole; the timeline only decides where the actions appear.
  */
-function answerActions(turnId: string | null, messageId?: string): HTMLElement {
+function answerActions(turnId: string | null, messageId?: string, answer?: { text: string; time: number }): HTMLElement {
   const bar = el('div', 'answer-actions');
   const sessionId = selectedId;
   // A turn's answer is named by its turn; one recorded outside any turn by its message.
@@ -4740,6 +5014,7 @@ function answerActions(turnId: string | null, messageId?: string): HTMLElement {
   });
   menu.addEventListener('keydown', event => { if (event.key === 'Escape') { menu.open = false; trigger.focus(); } });
   bar.append(copy, menu);
+  if (sessionId && messageId && NATIVE_ID.test(messageId) && answer) bar.append(bookmarkButton(sessionId, messageId, answer));
   const branch = branchPoint(messageId);
   if (branch) {
     // Branch in new chat (#482): ChatGPT's own branch at this reply, made with the first message.
@@ -5759,7 +6034,8 @@ function paintDetail(followBottom = historyBefore === null): void {
     const built = item.kind === 'compaction' ? compactionRow(item.block, cached?.row, item === latestCompaction)
       : item.kind === 'earlier' ? earlierVersionsRow(item.fold, key) : eventRow(held ?? item.event);
     if (answerTurn || looseAnswer) built.querySelector('.said')?.append(answerActions(answerTurn,
-      item.kind === 'event' && item.event.kind === 'assistant_message' ? item.event.messageId : undefined));
+      item.kind === 'event' && item.event.kind === 'assistant_message' ? item.event.messageId : undefined,
+      item.kind === 'event' && item.event.kind === 'assistant_message' ? { text: item.event.message.text, time: item.event.time } : undefined));
     if (item.kind === 'event' && editableQuestion(item.event, events)) {
       built.querySelector('.ev-body')?.append(questionActions(item.event, laterMessages.get(item.event.seq) ?? 0));
       built.dataset.questionId = item.event.messageId;
@@ -7197,7 +7473,7 @@ const CHAT_INPUTS = [
   'chatBrowser', 'cosBrowserMinimize', 'browserBridgePort',
   'goalIncludeToolCalls',
   'planBackend',
-  'finishTool', 'finishLeadMinutes', 'rotateTurnMinutes', 'localAppUsage', 'defaultChatModel', 'defaultChatReasoning', 'workerModel', 'workerReasoning', 'autoSelectSkills', 'backgroundChats', 'backgroundPlacement', 'browserOnly', 'autoRefreshPlugins',
+  'finishTool', 'finishHoldOnStop', 'finishLeadMinutes', 'rotateTurnMinutes', 'rotateStopFallback', 'localAppUsage', 'defaultChatModel', 'defaultChatReasoning', 'workerModel', 'workerReasoning', 'autoSelectSkills', 'backgroundChats', 'backgroundPlacement', 'browserOnly', 'autoRefreshPlugins',
   'goalBackend',
   'loopBackend',
   'helperModel', 'helperReasoning',
@@ -8067,9 +8343,11 @@ export function initChat(next: Deps): void {
   sidebarPins = createSidebarPins();
   sidebarOrder = createSidebarOrder($('sessionList'), () => [
     ...projectSortEntries(),
+    ...chatGroups.groups.map(group => ({ id: group.id, scope: chatGroupsScope(group.projectId) })),
     ...sessions.filter(entry => (entry.conversationId || entry.origin?.kind === 'desktop') && entry.origin?.kind !== 'worker')
-      .map(entry => ({ id: entry.id, scope: pinnedSortScope(projectGroup(entry.projectId) ?? '', pinnedChat(entry)) }))
+      .map(entry => ({ id: entry.id, scope: pinnedSortScope(chatSortList(entry), pinnedChat(entry)) }))
   ], paintSessions);
+  void run(api.chatGroups()).then(state => { if (state) { chatGroups = state; paintSessions(); } });
   deps = next;
   initComposerDictation();
   const stopComposerHeightMotion = installComposerHeightMotion($('composer'));
@@ -8586,6 +8864,10 @@ export function initChat(next: Deps): void {
     } else void sendComposer(undefined, undefined, undefined, controlAction);
   });
 
+  $('chatBookmarks').addEventListener('click', () => toggleRowMenu({
+    owner: 'bookmarks', anchor: () => $('chatBookmarks'), label: () => t('Bookmarks'), items: bookmarkMenuItems, wide: true
+  }));
+  onRowMenuChange(() => $('chatBookmarks').setAttribute('aria-expanded', String(rowMenuOpenFor('bookmarks'))));
   chatFind = initChatFind({
     selectedId: () => selectedId,
     find: async (id, query) => (await run(api.findInChat(id, query))) ?? null,

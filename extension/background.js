@@ -3521,6 +3521,8 @@ async function performBrowserRepairs(repairs, policy) {
     const repairAction = target ? 'reloaded' : 'reopened';
     try {
       const documentId = target ? tabDocuments[String(target.id)] : null;
+      let validateRepair = null;
+      let probedAfterValidation = false;
       // Suspension grants a reload of a still-suspended shell, never a new tab.
       if (suspended) {
         if (!target) continue;
@@ -3559,24 +3561,28 @@ async function performBrowserRepairs(repairs, policy) {
         const claim = await call('/repairs/claim', { method: 'POST', body: JSON.stringify({ token }) });
         if (!claim.ok || claim.data?.allowed !== true) continue;
         if (target && !suspended) {
-          const latest = inspectTurn ? await tabReply(target.id, { type: 'clf-repair-check', conversationId, draftOnly,
-            ...(check?.safe === true ? { expected: { revision: check.revision, turnId: check.turnId, questionId: check.questionId } } : {}) },
-            documentId ? { documentId } : undefined) : null;
-          const tab = await chrome.tabs.get(target.id);
-          // What exactly stopped the action, so the app's log can say it (#1086): the second
-          // check's own reason, a first check the page never answered, or the tab itself.
-          const changed = tab.pendingUrl ? 'navigating'
-            : conversationForTab(tab) !== conversationId ? 'other-chat'
-            : tabDocuments[String(target.id)] !== documentId ? 'new-document'
-            : !inspectTurn ? null
-            : latest?.safe === false ? (latest.why === 'changed' ? repairChangeDetail(latest) : latest.why || 'unknown')
-            : !check?.safe && latest?.safe === true ? 'first-unanswered' : null;
-          if (changed) {
-            // No browser action occurred. Release only this exact claim; a
-            // concurrently retired episode cannot be reconstructed by this ACK.
-            await call(`/status?repairFailed=${encodeURIComponent(token)}&repairAction=${repairAction}&why=changed&detail=${encodeURIComponent(changed)}`);
-            continue;
-          }
+          validateRepair = async () => {
+            const latest = inspectTurn ? await tabReply(target.id, { type: 'clf-repair-check', conversationId, draftOnly,
+              ...(check?.safe === true ? { expected: { revision: check.revision, turnId: check.turnId, questionId: check.questionId } } : {}) },
+              documentId ? { documentId } : undefined) : null;
+            const tab = await chrome.tabs.get(target.id);
+            // What exactly stopped the action, so the app's log can say it (#1086): the second
+            // check's own reason, a first check the page never answered, or the tab itself.
+            const changed = tab.pendingUrl ? 'navigating'
+              : conversationForTab(tab) !== conversationId ? 'other-chat'
+              : tabDocuments[String(target.id)] !== documentId ? 'new-document'
+              : !inspectTurn ? null
+              : latest?.safe === false ? (latest.why === 'changed' ? repairChangeDetail(latest) : latest.why || 'unknown')
+              : !check?.safe && latest?.safe === true ? 'first-unanswered' : null;
+            if (changed) {
+              // No browser action occurred. Release only this exact claim; a
+              // concurrently retired episode cannot be reconstructed by this ACK.
+              await call(`/status?repairFailed=${encodeURIComponent(token)}&repairAction=${repairAction}&why=changed&detail=${encodeURIComponent(changed)}`);
+              return false;
+            }
+            return true;
+          };
+          if (!await validateRepair()) continue;
         }
       }
       if (target && suspended && requiresClaim) {
@@ -3595,6 +3601,7 @@ async function performBrowserRepairs(repairs, policy) {
         // where the watchdog keeps interrupting the recovery it is meant to help. Ask the current
         // document to retry its own ticket first; only an unavailable/stale page falls through to
         // the reload path below. The content script still has to pass every source Stop/Send fence.
+        probedAfterValidation = true;
         const resumed = await tabReply(target.id,
           { type: 'clf-resume-compaction', conversationId }, documentId ? { documentId } : undefined);
         if (resumed?.accepted === true) {
@@ -3610,6 +3617,7 @@ async function performBrowserRepairs(repairs, policy) {
         // same destructive edge once ChatGPT has already recovered: keep a resumed stream queued
         // for another pass, and retire the episode without navigation only after its exact
         // transport error has disappeared. A still-visible error keeps the existing reload path.
+        probedAfterValidation = true;
         const status = await tabReply(target.id, { type: 'clf-page-status' },
           documentId ? { documentId } : undefined);
         if (status?.ok === true && status.streaming === true &&
@@ -3632,6 +3640,7 @@ async function performBrowserRepairs(repairs, policy) {
         // confirmed, and its delivery presses Stop first when ChatGPT still shows it, so the
         // page is left as it is. Only when the app says that Continue will follow: with automatic
         // recovery off and no Goal nothing is filed, and the reload stays the chat's one chance.
+        probedAfterValidation = true;
         const status = await tabReply(target.id, { type: 'clf-page-status' },
           documentId ? { documentId } : undefined);
         if (status?.ok === true && status.assistantError === true) {
@@ -3646,6 +3655,7 @@ async function performBrowserRepairs(repairs, policy) {
         // or answers is the repair; only a silent one is reloaded.
         const tab = await chrome.tabs.get(target.id);
         const loading = tab.status === 'loading' || Boolean(tab.pendingUrl);
+        probedAfterValidation = true;
         const status = loading ? null : await tabReply(target.id, { type: 'clf-page-status' },
           documentId ? { documentId } : undefined);
         if (loading || status?.ok === true) {
@@ -3653,6 +3663,9 @@ async function performBrowserRepairs(repairs, policy) {
           continue;
         }
       }
+      // Status/resume probes yield after the claim fence. Reuse that exact fence on
+      // their result before reloading; an unavailable page still grants no new veto.
+      if (probedAfterValidation && validateRepair && !await validateRepair()) continue;
       if (target) await chrome.tabs.reload(target.id);
       else {
         await createChatTab(`https://chatgpt.com/c/${encodeURIComponent(conversationId)}`, policy.background === true, focus);

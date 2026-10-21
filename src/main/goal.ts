@@ -654,11 +654,14 @@ export async function syncGoalPickupRecoveryNow(conversationId: string, replyId:
   return true;
 }
 
-let goalReplyAccepts: Promise<void> = Promise.resolve();
-/** Freeze eligibility and its diagnostic together on the existing reply ledger. */
+const goalReplyAccepts = new Map<string, Promise<void>>();
+/** Freeze eligibility and its diagnostic together for one conversation. */
 export function acceptGoalReplyNow(input: Parameters<typeof acceptGoalReply>[0]): Promise<void> {
-  const write = goalReplyAccepts.then(() => acceptGoalReply(input));
-  goalReplyAccepts = write.catch(() => {});
+  const write = (goalReplyAccepts.get(input.conversationId) ?? Promise.resolve()).then(() => acceptGoalReply(input));
+  const tail = write.catch(() => {}).finally(() => {
+    if (goalReplyAccepts.get(input.conversationId) === tail) goalReplyAccepts.delete(input.conversationId);
+  });
+  goalReplyAccepts.set(input.conversationId, tail);
   return write;
 }
 
@@ -709,10 +712,15 @@ async function acceptGoalReply(input: {
     const [recorded] = await readRecentEvents(input.sessionId, 1, { kinds: ['progress'],
       acceptEvent: event => event.kind === 'progress' && event.progressId === progressId });
     if (!recorded) {
-      const { recordProgress } = await import('./session/recorder.js');
-      if (!await recordProgress(input.sessionId, progressId,
-        LOOP_MCP_CALL_MISSING_NOTICE,
-        undefined, stalledTurn)) throw new Error('Loop diagnostic could not be recorded');
+      try {
+        const { recordProgress } = await import('./session/recorder.js');
+        if (!await recordProgress(input.sessionId, progressId,
+          LOOP_MCP_CALL_MISSING_NOTICE, undefined, stalledTurn)) {
+          logWarn('goal: Loop diagnostic could not be recorded');
+        }
+      } catch {
+        logWarn('goal: Loop diagnostic could not be recorded');
+      }
     }
   }
   if (goalReplies.get(input.conversationId) !== current || (input.current && !input.current())) return;
@@ -724,9 +732,8 @@ async function acceptGoalReply(input: {
       current.replyId === `turn:${input.turnId}`.slice(0, 200)
   );
   const before = current ? { ...current } : null;
-  const bounded = snapshotGoalReplies().replies;
   const active = armed && !missingMcp;
-  goalReplies.set(input.conversationId, {
+  const accepted: GoalReplyObligation = {
     conversationId: input.conversationId,
     sessionId: input.sessionId,
     replyId: input.replyId.slice(0, 200),
@@ -743,17 +750,17 @@ async function acceptGoalReply(input: {
     // policy or reopen a decision the page already acknowledged in the meantime.
     acceptedAt: provisionalUpgrade ? current!.acceptedAt : Date.now(),
     state: provisionalUpgrade ? current!.state : active ? 'pending' : 'handled'
-  });
+  };
+  goalReplies.set(input.conversationId, accepted);
   try {
     await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
   } catch (error) {
-    // The rejected write is one whole revision, so the rollback is too: the row this accept
-    // added and the expired rows it pruned go back together, leaving the ledger exactly as the
-    // decision found it.
-    goalReplies.clear();
-    for (const reply of bounded) goalReplies.set(reply.conversationId, reply);
-    if (before) goalReplies.set(input.conversationId, before);
-    else goalReplies.delete(input.conversationId);
+    // Other chats can advance while this write is pending. Roll back only this acceptance,
+    // and never replace a newer row installed by another control of the same conversation.
+    if (goalReplies.get(input.conversationId) === accepted) {
+      if (before) goalReplies.set(input.conversationId, before);
+      else goalReplies.delete(input.conversationId);
+    }
     persistGoalRepliesSoon();
     throw error;
   }

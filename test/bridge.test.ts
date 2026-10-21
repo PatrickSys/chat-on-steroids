@@ -13416,6 +13416,8 @@ describe('unattributed activity recovery', () => {
   });
 
   it.each([
+    { model: 'GPT-5.6 Sol', finishTool: false, afterTurn: false, diagnosticFailure: 'null' },
+    { model: 'GPT-5.6 Sol', finishTool: false, afterTurn: false, splitEnd: true, diagnosticFailure: 'throw' },
     { model: 'GPT-5.6 Sol', finishTool: false, afterTurn: false, splitEnd: false },
     { model: 'GPT-5.6 Sol', finishTool: true, afterTurn: false },
     { model: 'GPT-6 Astra', finishTool: true, afterTurn: false, finishOnly: true },
@@ -13428,7 +13430,7 @@ describe('unattributed activity recovery', () => {
     // An upstream turn rotation interrupts the source turn before the fresh answer starts.
     { model: 'GPT-5.6 Sol', finishTool: false, afterTurn: false, outcome: 'interrupted' },
     { model: 'GPT-6 Pro', finishTool: false, afterTurn: false, outcome: 'failed' }
-  ])('records one no-tool Loop diagnostic only after completion ($model, finish=$finishTool, split=$splitEnd, outcome=$outcome)', async ({ model, finishTool, afterTurn, finishOnly = false, splitEnd = false, outcome = 'completed' }) => {
+  ])('records one no-tool Loop diagnostic only after completion ($model, finish=$finishTool, split=$splitEnd, outcome=$outcome)', async ({ model, finishTool, afterTurn, finishOnly = false, splitEnd = false, outcome = 'completed', diagnosticFailure }) => {
     const chat = randomUUID();
     const goal = await import('../src/main/goal.js');
     const { findSessionByConversation, readRecentEvents, flushSessions, resetSessionStoreForTests, initSessionStore } = await import('../src/main/session/store.js');
@@ -13438,6 +13440,10 @@ describe('unattributed activity recovery', () => {
     globalThis.fetch = helper;
     await saveConfig({ ...previous, ui: { ...previous.ui, finishTool }, goal: { ...previous.goal, enabled: true, mode: 'loop' } });
     await setSecret('openRouterApiKey', 'sk-or-loop-test');
+    const recorder = await import('../src/main/session/recorder.js');
+    const recording = diagnosticFailure ? vi.spyOn(recorder, 'recordProgress') : null;
+    if (diagnosticFailure === 'null') recording!.mockResolvedValue(null);
+    if (diagnosticFailure === 'throw') recording!.mockRejectedValue(new Error('diagnostic write failed'));
     try {
       await pair();
       await goal.setGoalSwitchNow(chat, 'loop', true, afterTurn);
@@ -13451,10 +13457,13 @@ describe('unattributed activity recovery', () => {
         .filter(event => event.kind === 'progress' && event.progressId === 'loop-stalled:no-tool-turn');
       // An apparent final with the same stable id can still belong to the running turn.
       expect(await diagnostics()).toHaveLength(0);
-      await events(chat, [...(splitEnd ? [] : [answer]), endTurn('no-tool-turn', outcome)]);
+      const completed = await events(chat, [...(splitEnd ? [] : [answer]), endTurn('no-tool-turn', outcome)]);
+      expect(completed.status).toBe(200);
+      if (diagnosticFailure) expect(goal.snapshotGoalReplies().replies).toContainEqual(
+        expect.objectContaining({ conversationId: chat, replyId: 'stable-answer', state: 'handled' }));
       const rows = await diagnostics();
-      expect(rows).toHaveLength(outcome === 'completed' && !finishOnly ? 1 : 0);
-      if (outcome === 'completed' && !finishOnly) expect(rows[0]).toMatchObject({ source: 'app', turnId: 'no-tool-turn',
+      expect(rows).toHaveLength(outcome === 'completed' && !finishOnly && !diagnosticFailure ? 1 : 0);
+      if (outcome === 'completed' && !finishOnly && !diagnosticFailure) expect(rows[0]).toMatchObject({ source: 'app', turnId: 'no-tool-turn',
         message: { text: expect.stringContaining('no local tool call was recorded for it') } });
       expect(goalPendingReplyFor(chat)).toBeNull();
       expect(goal.goalViewFor(chat)).toBeNull();
@@ -13470,7 +13479,7 @@ describe('unattributed activity recovery', () => {
       expect(await diagnostics()).toEqual(rows);
       expect(helper).not.toHaveBeenCalled();
       expect(await maintenance()).toBeNull();
-    } finally { globalThis.fetch = realFetch; resetGoalStateForTests(); await setSecret('openRouterApiKey', ''); await saveConfig(previous); }
+    } finally { recording?.mockRestore(); globalThis.fetch = realFetch; resetGoalStateForTests(); await setSecret('openRouterApiKey', ''); await saveConfig(previous); }
   });
 
   it('does not diagnose a deliberately rearmed no-tool Loop reply as paused', async () => {

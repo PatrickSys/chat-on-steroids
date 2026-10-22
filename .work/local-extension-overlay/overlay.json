@@ -1,0 +1,19 @@
+{
+  "base_release": "2.1.44",
+  "base_commit": "4666e46f473b35b5842d00c993940c2c372e951e",
+  "files": [
+    {
+      "file": "content.js",
+      "sha256": "788afe13628663afa76689a60d484127647297e6626f65847f4a1ee32b3a7a86",
+      "bytes": 790695
+    },
+    {
+      "file": "background.js",
+      "sha256": "4ef92b1577387046a34dcaf4af6c3b40de5ec2a0e6e69d4dc9fa131ca50311f8",
+      "bytes": 314450
+    }
+  ],
+  "purpose": "private bounded recovery compatibility; not an upstream release",
+  "rollback": "restore the backed-up 2.1.44 bundled files then restart normally",
+  "source_commit": "df2960a1577165ddc4dc7eb32119095b09268dc1"
+}

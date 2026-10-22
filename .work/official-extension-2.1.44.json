@@ -1,0 +1,26 @@
+[
+  {
+    "file": "content.js",
+    "archive_entry": "content.js",
+    "sha256": "c3a2bdac34010d1e9f2fb18ba5bbc724d37469c1f5f6c4fbe921ad3938a596cf",
+    "bytes": 788341
+  },
+  {
+    "file": "background.js",
+    "archive_entry": "background.js",
+    "sha256": "0f085c79d1c56372c5212f06d4bc1fc1136ceb3afbfb4d851ed8f1001c56abf0",
+    "bytes": 313797
+  },
+  {
+    "file": "build-stamp.txt",
+    "archive_entry": "build-stamp.txt",
+    "sha256": "7f0696377cb788f98ecbfbadcb9c705a20c1c0cc525499c49b69b3c751177740",
+    "bytes": 13
+  },
+  {
+    "file": "manifest.json",
+    "archive_entry": "manifest.json",
+    "sha256": "dce248b08364eeecc5f7fd3262a8734bf386c35de0c87358c4e42f21c097ac42",
+    "bytes": 2160
+  }
+]

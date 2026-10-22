@@ -3528,7 +3528,6 @@ async function performBrowserRepairs(repairs, policy) {
     try {
       const documentId = target ? tabDocuments[String(target.id)] : null;
       let validateRepair = null;
-      let probedAfterValidation = false;
       // Suspension grants a reload of a still-suspended shell, never a new tab.
       if (suspended) {
         if (!target) continue;
@@ -3591,23 +3590,12 @@ async function performBrowserRepairs(repairs, policy) {
           if (!await validateRepair()) continue;
         }
       }
-      if (target && suspended && requiresClaim) {
-        const tab = await chrome.tabs.get(target.id);
-        const changed = tab.pendingUrl ? 'navigating' : conversationForTab(tab) !== conversationId ? 'other-chat'
-          : tab.discarded !== true && tab.frozen !== true ? 'woke-up'
-          : tabDocuments[String(target.id)] !== documentId ? 'new-document' : null;
-        if (changed) {
-          await call(`/status?repairFailed=${encodeURIComponent(token)}&repairAction=${repairAction}&why=changed&detail=${encodeURIComponent(changed)}`);
-          continue;
-        }
-      }
       if (target && reason === 'compaction' && requiresClaim) {
         // A responsive source already owns the durable compaction ticket. Reloading that exact
         // document destroys an in-progress settle/Stop attempt and can create a two-minute loop
         // where the watchdog keeps interrupting the recovery it is meant to help. Ask the current
         // document to retry its own ticket first; only an unavailable/stale page falls through to
         // the reload path below. The content script still has to pass every source Stop/Send fence.
-        probedAfterValidation = true;
         const resumed = await tabReply(target.id,
           { type: 'clf-resume-compaction', conversationId }, documentId ? { documentId } : undefined);
         if (resumed?.accepted === true) {
@@ -3623,7 +3611,6 @@ async function performBrowserRepairs(repairs, policy) {
         // same destructive edge once ChatGPT has already recovered: keep a resumed stream queued
         // for another pass, and retire the episode without navigation only after its exact
         // transport error has disappeared. A still-visible error keeps the existing reload path.
-        probedAfterValidation = true;
         const status = await tabReply(target.id, { type: 'clf-page-status' },
           documentId ? { documentId } : undefined);
         if (status?.ok === true && status.streaming === true &&
@@ -3646,7 +3633,6 @@ async function performBrowserRepairs(repairs, policy) {
         // confirmed, and its delivery presses Stop first when ChatGPT still shows it, so the
         // page is left as it is. Only when the app says that Continue will follow: with automatic
         // recovery off and no Goal nothing is filed, and the reload stays the chat's one chance.
-        probedAfterValidation = true;
         const status = await tabReply(target.id, { type: 'clf-page-status' },
           documentId ? { documentId } : undefined);
         if (status?.ok === true && status.assistantError === true) {
@@ -3661,7 +3647,6 @@ async function performBrowserRepairs(repairs, policy) {
         // or answers is the repair; only a silent one is reloaded.
         const tab = await chrome.tabs.get(target.id);
         const loading = tab.status === 'loading' || Boolean(tab.pendingUrl);
-        probedAfterValidation = true;
         const status = loading ? null : await tabReply(target.id, { type: 'clf-page-status' },
           documentId ? { documentId } : undefined);
         if (loading || status?.ok === true) {
@@ -3669,9 +3654,27 @@ async function performBrowserRepairs(repairs, policy) {
           continue;
         }
       }
-      // Status/resume probes yield after the claim fence. Reuse that exact fence on
-      // their result before reloading; an unavailable page still grants no new veto.
-      if (probedAfterValidation && validateRepair && !await validateRepair()) continue;
+      // Page probes can outlive app-side Stop, a provider history hold, or the source
+      // obligation. Validate the existing claim, without buying another attempt.
+      if (requiresClaim) {
+        const valid = await call('/repairs/claim', { method: 'POST', body: JSON.stringify({ token, validate: true }) });
+        if (!valid.ok || valid.data?.allowed !== true) {
+          await call(`/status?repairFailed=${encodeURIComponent(token)}&repairAction=${repairAction}&why=deferred`);
+          continue;
+        }
+      }
+      // Validation itself yields. Keep the page/document/progress fence last too.
+      if (validateRepair && !await validateRepair()) continue;
+      if (target && suspended && requiresClaim) {
+        const tab = await chrome.tabs.get(target.id);
+        const changed = tab.pendingUrl ? 'navigating' : conversationForTab(tab) !== conversationId ? 'other-chat'
+          : tab.discarded !== true && tab.frozen !== true ? 'woke-up'
+          : tabDocuments[String(target.id)] !== documentId ? 'new-document' : null;
+        if (changed) {
+          await call(`/status?repairFailed=${encodeURIComponent(token)}&repairAction=${repairAction}&why=changed&detail=${encodeURIComponent(changed)}`);
+          continue;
+        }
+      }
       if (target) await chrome.tabs.reload(target.id);
       else {
         await createChatTab(`https://chatgpt.com/c/${encodeURIComponent(conversationId)}`, policy.background === true, focus);

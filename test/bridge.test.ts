@@ -8,6 +8,7 @@
  */
 
 import { readFileSync } from 'node:fs';
+import vm from 'node:vm';
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -11278,6 +11279,113 @@ describe('unattributed activity recovery', () => {
           expect((await request('POST', '/repairs/claim', { body: { token: resumed!.token } })).body.allowed).toBe(false);
           expect(getLog().some(entry => entry.message.includes('recovery deferred before any browser action'))).toBe(true);
         }
+      } finally { vi.useRealTimers(); }
+    });
+
+  it.each(['silence', 'unattributed'].flatMap(reason =>
+    ['current', 'history-limit', 'stopped'].map(state => ({ reason, state }))))(
+    'runs the production browser repair against native authority: $reason / $state', async ({ reason, state }) => {
+      vi.useFakeTimers();
+      try {
+        await pair();
+        const { setGoalSwitchNow } = await import('../src/main/goal.js');
+        await setGoalSwitchNow(PRIME, 'loop', true, true);
+        await events(PRIME, [
+          { kind: 'model_selection', time: Date.now(), model: 'GPT-5.6 Sol', reasoningEffort: 'high' },
+          openTurn('paired-authority')
+        ]);
+        if (reason === 'unattributed') {
+          await unattributedTurn('paired-unattributed-request');
+          await vi.advanceTimersByTimeAsync(15_000);
+        } else {
+          await attributed(PRIME, false, Date.now());
+          await vi.advanceTimersByTimeAsync(CHAT_SILENCE_MS + 1);
+          await sweepStaleSwarm(Date.now());
+        }
+        const handout = await maintenance();
+        expect(handout).toMatchObject({ conversationId: PRIME, reason, requiresClaim: true });
+        const gate = faultGate();
+        const reload = vi.fn();
+        const create = vi.fn();
+        let receipts = 0;
+        const tab = { id: 76, url: `https://chatgpt.com/c/${PRIME}` };
+        const source = readFileSync(new URL('../extension/background.js', import.meta.url), 'utf8');
+        const repair = vm.runInNewContext(`${source.slice(source.indexOf('async function performBrowserRepairs('),
+          source.indexOf('\nfunction conversationStillOpen('))}\nperformBrowserRepairs`, {
+          tabConversations: { '76': PRIME }, tabDocuments: { '76': 'live-document' },
+          conversationForTab: (value: { url?: string }) => value.url?.split('/c/')[1] ?? null,
+          createChatTab: create, CHATGPT_TAB_URLS: ['https://chatgpt.com/*'],
+          chrome: { tabs: { query: async () => [tab], get: async () => tab, reload } },
+          call: async (route: string, init?: { method?: string; body?: string }) => {
+            if (new URL(route, base).searchParams.has('repaired')) receipts++;
+            const result = await request(init?.method ?? 'GET', route,
+              init?.body ? { body: JSON.parse(init.body) } : {});
+            return { ok: result.status === 200, data: result.body };
+          },
+          tabReply: async (_id: number, message: { type: string }) => {
+            if (message.type === 'clf-page-status') { await gate.hold(); return undefined; }
+            return { safe: true, revision: 1, turnId: 'paired-authority', questionId: 'question' };
+          }
+        });
+        const running = repair([handout], {});
+        await gate.entered;
+        if (state === 'history-limit') await events(PRIME, [{ kind: 'chat_error', time: Date.now(),
+          turnId: 'paired-authority', recoverable: false, blocking: true, retryAt: Date.now() + 31_000,
+          text: 'ChatGPT temporarily rate-limited loading this conversation history.' }]);
+        if (state === 'stopped') await events(PRIME, [endTurn('paired-authority', 'stopped')]);
+        gate.release(); await running;
+        expect(reload).toHaveBeenCalledTimes(state === 'current' ? 1 : 0);
+        expect(create).not.toHaveBeenCalled();
+        expect(receipts).toBe(state === 'current' ? 1 : 0);
+        if (state !== 'current') {
+          const input = await import('../src/main/session/input.js');
+          const session = (await findSessionByConversation(PRIME))!;
+          expect((await input.listInputs()).filter(row => row.sessionId === session.id && row.recovery)).toEqual([]);
+        }
+        if (reason === 'unattributed' && state === 'history-limit') {
+          expect(await maintenance()).toBeNull();
+          await vi.advanceTimersByTimeAsync(1);
+          await unattributedTurn('paired-unattributed-request');
+          await vi.advanceTimersByTimeAsync(31_000);
+          const resumed = await maintenance();
+          expect(resumed).toMatchObject({ conversationId: PRIME, reason: 'unattributed' });
+          expect(resumed!.token).not.toBe(handout!.token);
+          expect((await request('POST', '/repairs/claim', { body: { token: handout!.token } })).body.allowed).toBe(false);
+          await repair([resumed], {});
+          expect(reload).toHaveBeenCalledTimes(1);
+          expect(receipts).toBe(1);
+          await vi.advanceTimersByTimeAsync(300_000);
+          expect(await maintenance()).toBeNull();
+        }
+      } finally { vi.useRealTimers(); }
+    });
+
+  it.each(['none', 'one'])(
+    'keeps unattributed receipt evidence at the existing cohort boundary: %s', async receipt => {
+      vi.useFakeTimers();
+      try {
+        await saveConfig({ ...getConfig(), multiAgent: { ...getConfig().multiAgent, recoverAgentTabs: false } });
+        await pair();
+        await events(PRIME, [openTurn('cohort-prime')]);
+        await events(OTHER, [openTurn('cohort-other')]);
+        await unattributedTurn('cohort-lost-receipt');
+        const startedAt = Date.now();
+        await vi.advanceTimersByTimeAsync(60_000);
+        const first = await maintenanceBatch();
+        expect(first).toHaveLength(2);
+        for (const row of first) expect((await request('POST', '/repairs/claim', { body: { token: row.token } })).body.allowed).toBe(true);
+        // A claim can precede a lost action receipt; it alone proves no browser action.
+        if (receipt === 'one') await maintenanceBatch(first[0]!.token);
+        await vi.advanceTimersByTimeAsync(1);
+        await unattributedTurn('cohort-lost-receipt');
+        await vi.advanceTimersByTimeAsync(startedAt + 300_000 - Date.now());
+        const second = await maintenanceBatch();
+        // Existing policy shares receipt evidence across the cohort, not per candidate.
+        expect(second).toHaveLength(receipt === 'one' ? 2 : 0);
+        for (const row of second) await maintenanceBatch(row.token);
+        await vi.advanceTimersByTimeAsync(300_000);
+        await unattributedTurn('cohort-lost-receipt');
+        expect(await maintenanceBatch()).toEqual([]);
       } finally { vi.useRealTimers(); }
     });
 

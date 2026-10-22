@@ -3508,7 +3508,10 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const unchosen = notChosenBrowser(req);
     let body: unknown;
     try { body = await readBody(req); } catch { return unchosen ? json(res, 200, { allowed: false }, origin) : json(res, 400, { error: 'bad_request' }, origin); }
-    const token = body && typeof body === 'object' && !Array.isArray(body) ? (body as Record<string, unknown>).token : null;
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return unchosen ? json(res, 200, { allowed: false }, origin) : json(res, 400, { error: 'bad_request' }, origin);
+    const token = 'token' in body ? body.token : null;
+    if ('validate' in body && typeof body.validate !== 'boolean') return unchosen ? json(res, 200, { allowed: false }, origin) : json(res, 400, { error: 'bad_request' }, origin);
+    const validating = 'validate' in body && body.validate === true;
     if (typeof token !== 'string' || token.length > 128) return unchosen ? json(res, 200, { allowed: false }, origin) : json(res, 400, { error: 'bad_request' }, origin);
     const found = [...repairsInFlight].find(([, repair]) => repairNeedsClaim(repair) && repair.token === token && repair.state === 'handed');
     if (!found) return json(res, 200, { allowed: false }, origin);
@@ -3534,7 +3537,10 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       compactionRepairCurrent(conversationId, repair);
     // An observation still publishing can revoke this handout. Refuse this
     // claim transiently; the same unclaimed token remains eligible to be checked.
-    const allowed = current && observationWritesInFlight === 0 && repairsInFlight.get(conversationId) === repair && repair.state === 'handed' && !repair.claimed;
+    const allowed = current && observationWritesInFlight === 0 && repairsInFlight.get(conversationId) === repair &&
+      repair.state === 'handed' && Date.now() >= repair.notBefore && providerHistoryBackoff(conversationId) === null &&
+      !isChatBlocked(conversationId) && !stopRequestedFor(conversationId) &&
+      (validating ? repair.claimed === true : !repair.claimed);
     if (!allowed) {
       // The page is there and asked: this offer is not one nobody picked up (#1922). Say why it
       // was refused, once a minute per chat and reason, so "never asked" and "refused" differ.
@@ -3551,12 +3557,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         logInfo(`bridge: refused the ${repair.reason} repair claim for ${conversationId}: ${why}`);
       }
     }
-    if (allowed) {
+    // Validation observes the already claimed action; it never grants another one.
+    if (allowed && !validating) {
       repair.claimed = true;
       if (repair.reason === 'assistant-error' && repair.assistantSource)
         turnRepairSpent.set(conversationId, { sessionId: repair.sessionId, turnKey: repair.assistantSource.key, token, at: Date.now() });
-      if (repair.attribution && repair.attribution.incident.firstAttemptAt === null)
-        repair.attribution.incident.firstAttemptAt = Date.now();
     }
     return json(res, 200, { allowed }, origin);
   }
@@ -11573,6 +11578,7 @@ async function failRepairAttempt(
     // ChatGPT recovered by itself and is answering: the page keeps the reload for after the answer
     // instead of ending it. Nothing failed, so it is neither a warning nor a "Reload failed" row.
     const streaming = why === 'streaming';
+    const deferred = why === 'deferred';
     const heldByApproval = repair.reason === 'unattributed' && streaming && approval;
     if (heldByApproval) {
       // The pre-navigation page check can see the card before the next activity poll.
@@ -11587,6 +11593,8 @@ async function failRepairAttempt(
       // same repair tries again after the short cooldown below. As a warning it counted as a problem
       // in Activity, sixteen times in two days on the maintainer's Mac (2026-11-01).
       logInfo(`bridge: the tab of ${conversationId} was still loading; the ${repair.reason} repair tries again in ${Math.round(NAVIGATION_RECOVERY_COOLDOWN_MS / 1000)} s`);
+    } else if (deferred) {
+      logInfo(`bridge: recovery deferred before any browser action for ${conversationId}; app authority changed`);
     } else {
       const exact = why === 'changed' ? repairChangeDetail(changeDetail) : null;
       const detail = why && Object.hasOwn(REPAIR_FAIL_REASONS, why) ? `: ${REPAIR_FAIL_REASONS[why]}${exact ? ` — ${exact}` : ''}` : '';
@@ -11596,18 +11604,24 @@ async function failRepairAttempt(
     await updateRepairProgress(
       conversationId,
       repair,
-      heldByApproval ? APPROVAL_REPAIR_DEFERRED_TEXT : streaming
+      heldByApproval ? APPROVAL_REPAIR_DEFERRED_TEXT : deferred
+        ? 'Browser recovery deferred before any browser action; app authority changed.'
+        : streaming
         ? repair.attribution ? 'Not reloaded: ChatGPT is answering.' : 'ChatGPT is answering again; recovery waits until it finishes.'
         : `${action === 'reopened' ? 'Reopen' : action === 'resumed' ? 'Resume' : 'Reload'} failed while ${repairPurpose(repair).during}${repair.attribution ? '.' : '; will retry.'}`
     );
     if (repairsInFlight.get(conversationId) !== repair) return;
+    // A reported attempt still spends the attribution pass, even if Chrome failed.
+    // Only an explicit pre-action deferral leaves it available after the hold.
+    if (!deferred && repair.attribution && repair.attribution.incident.firstAttemptAt === null)
+      repair.attribution.incident.firstAttemptAt = Date.now();
     if (repair.reason === 'assistant-error' && turnRepairSpent.get(conversationId)?.token === token)
       turnRepairSpent.delete(conversationId);
     if (why === 'changed' && changeDetail === 'navigating' && NAVIGATION_RETRIED.has(repair.reason)) {
       // Navigation is transient; keep the same repair episode and retry after the short navigation cooldown.
       repair.notBefore = Math.max(repair.notBefore, Date.now() + NAVIGATION_RECOVERY_COOLDOWN_MS);
     }
-    if (repair.reason === 'unattributed' && !heldByApproval) repair.state = 'done';
+    if (repair.reason === 'unattributed' && !heldByApproval && !deferred) repair.state = 'done';
     else {
       repair.state = 'queued';
       repair.claimed = false;

@@ -1396,10 +1396,11 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
         const url = new URL(input);
         if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
         if (url.pathname === '/repairs/claim') {
-          trace.push('claim');
-          if (mode === 'navigated-during-claim') navigated = true;
+          const validating = JSON.parse(String(init.body)).validate === true;
+          trace.push(validating ? 'validate' : 'claim');
+          if (!validating && mode === 'navigated-during-claim') navigated = true;
           expect(init.method).toBe('POST');
-          expect(JSON.parse(String(init.body))).toEqual({ token: 'attribution-attempt' });
+          expect(JSON.parse(String(init.body))).toEqual({ token: 'attribution-attempt', ...(validating ? { validate: true } : {}) });
           return mode === 'claim-unavailable' ? response(503, {}) : response(200, { allowed: !resolved });
         }
         if (url.pathname === '/status') {
@@ -1436,6 +1437,7 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
         // A no-tab repair whose chat has a live tab again keeps that tab (#864).
         if (reason === 'compaction' || reason === 'no-tab') expect(worker.tabsReload).not.toHaveBeenCalled();
         else expect(worker.tabsReload).toHaveBeenCalledExactlyOnceWith(21);
+        if (reason !== 'compaction' && reason !== 'no-tab') expect(trace.indexOf('validate')).toBeGreaterThan(trace.indexOf('claim'));
         expect(trace).toContain('repaired');
       } else {
         expect(worker.tabsReload).not.toHaveBeenCalled();

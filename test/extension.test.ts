@@ -1546,6 +1546,53 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
       expect(receipts).toBe(0);
     });
 
+  it.each(['current', 'history-limit', 'stopped', 'page-progress'])('revalidates app authority after a pending repair probe: %s', async state => {
+    let armed = false, handed = false, claimed = false, revoked = false, pageChanged = false;
+    let releaseProbe!: () => void, reachProbe!: () => void;
+    const pendingProbe = new Promise<void>(resolve => { releaseProbe = resolve; });
+    const probeReached = new Promise<void>(resolve => { reachProbe = resolve; });
+    const successReceipts: string[] = [];
+    const fetch = vi.fn(async (input: string, init?: RequestInit) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      // Only the app knows a new history delay or local Stop. The page did not change.
+      if (url.pathname === '/repairs/claim') {
+        if (JSON.parse(String(init?.body ?? '{}')).validate === true) {
+          pageChanged = state === 'page-progress';
+          return response(200, { allowed: claimed && !revoked });
+        }
+        claimed = true; return response(200, { allowed: true });
+      }
+      if (url.pathname === '/status') {
+        if (url.searchParams.has('repaired')) successReceipts.push(url.searchParams.get('repaired')!);
+        if (armed && !handed) {
+          handed = true;
+          return response(200, { repairs: [{ conversationId: CHAT, token: 'app-authority-race',
+            reason: 'silence', requiresClaim: true, continueFollows: true }] });
+        }
+        return response(200, { repairs: [] });
+      }
+      return response(200, {});
+    });
+    const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch,
+      tabsQuery: async () => [{ id: 21, url: `https://chatgpt.com/c/${CHAT}` }],
+      tabsGet: async () => ({ id: 21, url: `https://chatgpt.com/c/${CHAT}` }),
+      tabsSendMessage: async (_id, message) => {
+        if (message.type === 'clf-page-status' && claimed) {
+          reachProbe(); await pendingProbe; return undefined;
+        }
+        return message.type === 'clf-repair-check'
+          ? { safe: !pageChanged, revision: pageChanged ? 2 : 1, turnId: 'source', questionId: 'question' } : { ok: true };
+      } });
+    await worker.registerTab(21); await worker.send({ type: 'bind', conversationId: CHAT }, 21);
+    await worker.fireAlarm(); armed = true;
+    const repair = worker.fireAlarm(); await probeReached;
+    revoked = state === 'history-limit' || state === 'stopped'; releaseProbe(); await repair; await worker.fireAlarm();
+    expect(worker.tabsReload).toHaveBeenCalledTimes(state === 'current' ? 1 : 0);
+    expect(worker.tabsCreate).not.toHaveBeenCalled();
+    expect(successReceipts).toHaveLength(state === 'current' ? 1 : 0);
+  });
+
   it.each([
     ['progress', 'changed-progress:app-progress'],
     ['first-unanswered', 'first-unanswered'],

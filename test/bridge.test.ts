@@ -11237,6 +11237,50 @@ describe('unattributed activity recovery', () => {
     } finally { vi.useRealTimers(); }
   });
 
+  it.each(['current', 'history-limit', 'stopped', 'blocked', 'new-turn'])(
+    'validates a claimed repair without granting another attempt: %s', async state => {
+      vi.useFakeTimers();
+      try {
+        await pair();
+        const { setGoalSwitchNow } = await import('../src/main/goal.js');
+        await setGoalSwitchNow(PRIME, 'loop', true, true);
+        await events(PRIME, [
+          { kind: 'model_selection', time: Date.now(), model: 'GPT-5.6 Sol', reasoningEffort: 'high' },
+          openTurn('claimed-authority')
+        ]);
+        await attributed(PRIME, false, Date.now());
+        await vi.advanceTimersByTimeAsync(CHAT_SILENCE_MS + 1);
+        await sweepStaleSwarm(Date.now());
+        const repair = await maintenance();
+        expect(repair).toMatchObject({ conversationId: PRIME, reason: 'silence' });
+        const validate = () => request('POST', '/repairs/claim', { body: { token: repair!.token, validate: true } });
+        expect((await validate()).body.allowed).toBe(false);
+        expect((await request('POST', '/repairs/claim', { body: { token: repair!.token } })).body.allowed).toBe(true);
+        expect((await validate()).body.allowed).toBe(true);
+        if (state === 'history-limit') await events(PRIME, [{ kind: 'chat_error', time: Date.now(),
+          turnId: 'claimed-authority', recoverable: false, blocking: true, retryAt: Date.now() + 31_000,
+          text: 'ChatGPT temporarily rate-limited loading this conversation history.' }]);
+        if (state === 'stopped') await events(PRIME, [endTurn('claimed-authority', 'stopped')]);
+        if (state === 'blocked') await setChatBlocked(PRIME, true);
+        if (state === 'new-turn') await events(PRIME, [openTurn('newer-authority')]);
+        expect((await validate()).body.allowed).toBe(state === 'current');
+        // A validation is not a second claim and cannot refund a spent attempt.
+        expect((await request('POST', '/repairs/claim', { body: { token: repair!.token } })).body.allowed).toBe(false);
+        if (state === 'history-limit') {
+          await request('GET', `/status?repairFailed=${encodeURIComponent(repair!.token)}&repairAction=reloaded&why=deferred`);
+          expect((await maintenanceBatch()).some(row => row.conversationId === PRIME)).toBe(false);
+          await vi.advanceTimersByTimeAsync(31_001);
+          const resumed = await maintenance();
+          expect(resumed).toMatchObject({ conversationId: PRIME, reason: 'silence' });
+          expect(resumed!.token).not.toBe(repair!.token);
+          expect((await request('POST', '/repairs/claim', { body: { token: repair!.token } })).body.allowed).toBe(false);
+          expect((await request('POST', '/repairs/claim', { body: { token: resumed!.token } })).body.allowed).toBe(true);
+          expect((await request('POST', '/repairs/claim', { body: { token: resumed!.token } })).body.allowed).toBe(false);
+          expect(getLog().some(entry => entry.message.includes('recovery deferred before any browser action'))).toBe(true);
+        }
+      } finally { vi.useRealTimers(); }
+    });
+
   it('keeps the history Retry-After deadline across a reversible bridge stop/start', async () => {
     vi.useFakeTimers();
     try {

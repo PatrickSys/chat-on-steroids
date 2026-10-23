@@ -15854,6 +15854,86 @@ describe('the goal loop over the bridge', () => {
     expect((await request('GET', `/activity?conversationId=${chat}`)).body.goal.pending).toBeNull();
   });
 
+  it('re-arms the same Offline Goal CONTINUE after Off/On when its objective is unchanged', async () => {
+    await pair();
+    const chat = 'cafe0192-0000-4000-8000-000000000192';
+    await saveConfig({
+      ...suiteConfig,
+      sessions: { ...suiteConfig.sessions, record: true },
+      goal: { ...suiteConfig.goal, backend: 'templates', enabled: false }
+    });
+    await request('POST', '/events', { body: { conversationId: chat, events: [
+      { kind: 'user_message', time: Date.now(), messageId: 'offline-goal-continue-user', text: 'Continue this same goal' }
+    ] } });
+    await request('POST', '/goal/objective', { body: { conversationId: chat, text: 'Continue this same goal', mode: 'goal' } });
+    await request('POST', '/events', { body: { conversationId: chat, events: [
+      { kind: 'turn_start', time: Date.now(), turnId: 'offline-goal-continue-old-turn' },
+      { kind: 'turn_end', time: Date.now(), turnId: 'offline-goal-continue-old-turn', outcome: 'completed' },
+      { kind: 'assistant_message', time: Date.now(), messageId: 'offline-goal-continue-old-final', turnId: 'offline-goal-continue-old-turn',
+        text: 'Continue with the next step.\n[[COS_GOAL:CONTINUE]]', state: 'final', final: true, goalEligible: true, activeNow: true }
+    ] } });
+    expect(goalPendingReplyFor(chat)).toMatchObject({
+      replyId: 'offline-goal-continue-old-final', turnId: 'offline-goal-continue-old-turn'
+    });
+
+    expect((await request('POST', '/settings', { body: { conversationId: chat, goal: false } })).status).toBe(200);
+    expect(goalPendingReplyFor(chat)).toBeNull();
+    expect((await request('POST', '/settings', { body: { conversationId: chat, goal: true } })).status).toBe(200);
+    expect(goalPendingReplyFor(chat)).toMatchObject({
+      replyId: 'offline-goal-continue-old-final', turnId: 'offline-goal-continue-old-turn'
+    });
+  });
+
+  it('preserves a stale Offline Goal tombstone through same-ID refresh and restore', async () => {
+    await pair();
+    const chat = 'cafe0193-0000-4000-8000-000000000193';
+    await saveConfig({
+      ...suiteConfig,
+      sessions: { ...suiteConfig.sessions, record: true },
+      goal: { ...suiteConfig.goal, backend: 'templates', enabled: false }
+    });
+    const first = await request('POST', '/events', { body: { conversationId: chat, events: [
+      { kind: 'user_message', time: Date.now(), messageId: 'offline-goal-tombstone-user', text: 'Finish the old objective' }
+    ] } });
+    const sessionId = first.body.sessionId as string;
+    await request('POST', '/goal/objective', { body: { conversationId: chat, text: 'Finish the old objective', mode: 'goal' } });
+    const oldFinal = {
+      kind: 'assistant_message', time: Date.now(), messageId: 'offline-goal-tombstone-final', turnId: 'offline-goal-tombstone-turn',
+      text: 'More work remains.\n[[COS_GOAL:CONTINUE]]', state: 'final', final: true, goalEligible: true, activeNow: true
+    };
+    await request('POST', '/events', { body: { conversationId: chat, events: [
+      { kind: 'turn_start', time: Date.now(), turnId: 'offline-goal-tombstone-turn' },
+      { kind: 'turn_end', time: Date.now(), turnId: 'offline-goal-tombstone-turn', outcome: 'completed' },
+      oldFinal
+    ] } });
+    expect(goalPendingReplyFor(chat)).toMatchObject({ replyId: 'offline-goal-tombstone-final' });
+    await request('POST', '/goal/objective', { body: { conversationId: chat, text: 'Inspect the new target document', mode: 'goal' } });
+    expect(goalPendingReplyFor(chat)).toBeNull();
+
+    const snapshot = () => readDurable<{ replies: Array<{
+      conversationId: string; replyId: string; state: 'pending' | 'handled'; staleObjective?: true
+    }> }>(GOAL_REPLIES_STATE);
+    expect(await snapshot()).toMatchObject({ replies: expect.arrayContaining([
+      expect.objectContaining({ conversationId: chat, replyId: 'offline-goal-tombstone-final', state: 'handled', staleObjective: true })
+    ]) });
+    await request('POST', '/events', { body: { conversationId: chat, events: [{ ...oldFinal, time: Date.now() + 1 }] } });
+    const refreshed = await snapshot();
+    expect(refreshed).toMatchObject({ replies: expect.arrayContaining([
+      expect.objectContaining({ conversationId: chat, replyId: 'offline-goal-tombstone-final', state: 'handled', staleObjective: true })
+    ]) });
+
+    const { restoreGoalReplies } = await import('../src/main/goal.js');
+    restoreGoalReplies(refreshed);
+    expect(goalPendingReplyFor(chat)).toBeNull();
+    const { setSessionAutomation } = await import('../src/main/bridge.js');
+    await setSessionAutomation(sessionId, 'off');
+    await setSessionAutomation(sessionId, 'goal');
+    expect(goalPendingReplyFor(chat)).toBeNull();
+    expect(await snapshot()).toMatchObject({ replies: expect.arrayContaining([
+      expect.objectContaining({ conversationId: chat, replyId: 'offline-goal-tombstone-final', state: 'handled', staleObjective: true })
+    ]) });
+  });
+
   it('keeps new Offline Goal turns live after stale completion is retired', async () => {
     await pair();
     const chat = 'cafe0191-0000-4000-8000-000000000191';
@@ -15884,6 +15964,11 @@ describe('the goal loop over the bridge', () => {
         text: 'One step remains.\n[[COS_GOAL:CONTINUE]]', state: 'final', final: true, goalEligible: true, activeNow: true }
     ] } });
     expect(goalPendingReplyFor(chat)).toMatchObject({ replyId: 'offline-goal-continue-final', turnId: 'offline-goal-continue-turn' });
+    const freshReply = (await readDurable<{ replies: Array<{
+      conversationId: string; replyId: string; staleObjective?: true
+    }> }>(GOAL_REPLIES_STATE))?.replies.find(row => row.conversationId === chat);
+    expect(freshReply).toMatchObject({ replyId: 'offline-goal-continue-final' });
+    expect(freshReply).not.toHaveProperty('staleObjective');
     const started = await request('POST', '/goal/draft', {
       body: { conversationId: chat, turnId: 'offline-goal-continue-turn', clientId: 'offline-goal-test' }
     });

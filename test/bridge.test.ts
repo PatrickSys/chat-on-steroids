@@ -16,6 +16,7 @@ import { once } from 'node:events';
 import { WebSocket } from 'ws';
 import sharp from 'sharp';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { GoalRepliesSnapshot } from '../src/main/goal.js';
 import { APP_VERSION, BRIDGE_PROTOCOL } from '../src/main/version.js';
 import { userPromptText } from '../src/shared/user-prompt.js';
 import { currentCoreInstructions } from '../src/main/mcp/instructions.js';
@@ -15910,9 +15911,7 @@ describe('the goal loop over the bridge', () => {
     await request('POST', '/goal/objective', { body: { conversationId: chat, text: 'Inspect the new target document', mode: 'goal' } });
     expect(goalPendingReplyFor(chat)).toBeNull();
 
-    const snapshot = () => readDurable<{ replies: Array<{
-      conversationId: string; replyId: string; state: 'pending' | 'handled'; staleObjective?: true
-    }> }>(GOAL_REPLIES_STATE);
+    const snapshot = () => readDurable<GoalRepliesSnapshot>(GOAL_REPLIES_STATE);
     expect(await snapshot()).toMatchObject({ replies: expect.arrayContaining([
       expect.objectContaining({ conversationId: chat, replyId: 'offline-goal-tombstone-final', state: 'handled', staleObjective: true })
     ]) });

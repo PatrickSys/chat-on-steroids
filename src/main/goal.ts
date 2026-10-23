@@ -415,6 +415,8 @@ function notifyGoalChange(): void { for (const listener of goalListeners) listen
  * only an explicit later activation may turn that exact tombstone into a fresh pickup.
  */
 interface GoalReplyObligation {
+  /** Its final predates a changed Offline Goal objective. Keep the replay tombstone. */
+  staleObjective?: true;
   /** Only the deliberate user activation setter may grant this exemption. */
   explicitActivation?: true;
   /** Exact source turn captured before its silence grant retired. Pro also requires opt-in. */
@@ -521,6 +523,7 @@ export function restoreGoalReplies(snapshot: GoalRepliesSnapshot | null): void {
         : Number.isSafeInteger(raw.pickupAttempts) && raw.pickupAttempts! >= BROWSER_PICKUP_MAX_ATTEMPTS
           ? { pickupStoppedAt: raw.acceptedAt } : {}),
       ...(raw.explicitActivation === true ? { explicitActivation: true } : {}),
+      ...(raw.staleObjective === true ? { staleObjective: true } : {}),
       eventSeq: raw.eventSeq,
       acceptedAt: raw.acceptedAt,
       state: raw.state
@@ -697,6 +700,7 @@ export async function acceptGoalReplyNow(input: {
     sessionId: input.sessionId,
     replyId: input.replyId.slice(0, 200),
     turnId: input.turnId.slice(0, 200),
+    ...(provisionalUpgrade && current?.staleObjective ? { staleObjective: true } : {}),
     ...(input.silenceSourceTurnId ? { silenceSourceTurnId: input.silenceSourceTurnId.slice(0, 200) } : {}),
     ...(input.silencePro ? { silencePro: true } : {}),
     ...(input.listenUntil ? { listenUntil: input.listenUntil } : {}),
@@ -1420,9 +1424,13 @@ export function retireGoalDraftsFor(conversationId: string): boolean {
  * composer. A later page simply drafts it again from the same durable reply identity.
  */
 export async function setGoalReplyActiveNow(conversationId: string, active: boolean, current: (silenceSourceTurnId?: string) => boolean = () => true): Promise<boolean> {
+  const canRearm = () => goalBackendFor(goalSwitchFor(conversationId).mode) !== 'templates' ||
+    !goalReplies.get(conversationId)?.staleObjective;
+  if (active && !canRearm()) active = false;
   const activationReply = goalReplies.get(conversationId);
   const silenceSource = (activationReply?.listenUntil ?? 0) <= Date.now() ? activationReply?.silenceSourceTurnId : undefined;
-  const stillCurrent = () => (!silenceSource || goalReplies.get(conversationId) === activationReply) && current(silenceSource);
+  const stillCurrent = () => (!active || canRearm()) &&
+    (!silenceSource || goalReplies.get(conversationId) === activationReply) && current(silenceSource);
   // Deliberate On is also meaningful after an unsuccessful answer. No automatic
   // observer may mint this activation: retain the exact ended source in the same
   // reply ledger, without pretending a failure was a final or a refresh receipt.
@@ -1480,6 +1488,12 @@ export async function setGoalReplyActiveNow(conversationId: string, active: bool
     return false;
   }
   return true;
+}
+
+export async function retireGoalReplyForObjectiveNow(conversationId: string): Promise<void> {
+  const reply = goalReplies.get(conversationId);
+  if (reply) reply.staleObjective = true;
+  await setGoalReplyActiveNow(conversationId, false);
 }
 
 /** A fabricated silence reply is not a final answer that a later On may re-arm. */

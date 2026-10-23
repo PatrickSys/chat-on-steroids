@@ -89,6 +89,7 @@ import {
   registerGoalDecisionChat,
   isGoalDecisionChat,
   goalProgressFor,
+  goalBackendFor,
   goalDraftBusy,
   goalArmedFor,
   GOAL_HOLD_TOOLS,
@@ -105,6 +106,7 @@ import {
   goalDraftNeedsIntervention,
   retireGoalDraftsFor,
   setGoalReplyActiveNow,
+  retireGoalReplyForObjectiveNow,
   withdrawSilenceGoalReplyNow,
   setGoalObjectiveNow,
   setGoalSwitchNow,
@@ -2208,6 +2210,10 @@ async function saveConversationObjective(id: string, text: string, named: 'goal'
     catch { throw new Error('goal_switch_not_durable'); }
   }
   await assertCurrent();
+  if (goalModeFor(id) === 'goal' && goalBackendFor('goal') === 'templates' && goalObjectiveFor(id) !== text.trim()) {
+    await retireGoalReplyForObjectiveNow(id);
+    await assertCurrent();
+  }
   const objective = await setGoalObjectiveNow(id, text);
   await assertCurrent();
   try {
@@ -4622,7 +4628,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         const chatId = settingsConversation as string;
         try {
           // The switch and the ticket are one user decision. Off durably closes the pickup;
-          // On (including Goal <-> Loop) re-arms the latest stable final under the new mode.
+          // On re-arms a stable final only when the driver can evaluate the new intent.
           await activateConversationGoalReply(
             chatId,
             chatSwitch.enabled && getConfig().sessions.record && (await goalKeyPresent(chatSwitch.mode))

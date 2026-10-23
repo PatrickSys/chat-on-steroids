@@ -2762,7 +2762,15 @@ export async function conversationMessages(sessionId: string, deliveredInput: re
     const before = carried.get(turn) ?? 0;
     const count = (callsByTurn.get(turn) ?? 0) + before;
     const continued = before ? `, ${before} of them before Chat On Steroids continued it in a fresh turn` : '';
-    ordered[at] = { ...ordered[at]!, content: `${ordered[at]!.content}\n\n[Chat On Steroids: ${count} tool call${count === 1 ? '' : 's'} ran in this turn${continued}. Arguments and results are not shown.]` };
+    const content = ordered[at]!.content;
+    const lastLine = content.trimEnd().split(/\r?\n/).at(-1)?.trim();
+    const note = `[Chat On Steroids: ${count} tool call${count === 1 ? '' : 's'} ran in this turn${continued}. Arguments and results are not shown.]`;
+    // App-owned evidence must not displace the assistant's exact terminal protocol line.
+    const marker = lastLine === '[[COS_GOAL:CONTINUE]]' || lastLine === '[[COS_GOAL:COMPLETE]]' ? lastLine : null;
+    const beforeMarker = marker ? content.trimEnd().slice(0, content.trimEnd().lastIndexOf('\n') + 1).trimEnd() : content;
+    ordered[at] = { ...ordered[at]!, content: marker
+      ? `${beforeMarker ? beforeMarker + '\n\n' : ''}${note}\n\n${marker}`
+      : `${content}\n\n${note}` };
   }
   for (const text of deliveredInput.slice(-5)) {
     const content = clip(userPromptText(text) ?? text, MAX_USER_MESSAGE_CHARS);

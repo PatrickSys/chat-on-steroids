@@ -519,6 +519,29 @@ describe('Goal decision backends', () => {
     expect(fetch).not.toHaveBeenCalled();
     expect(browser.request).not.toHaveBeenCalled();
   });
+  it.each([0, 1].flatMap(tools => [
+    { tools, text: 'More useful work remains\n[[COS_GOAL:CONTINUE]]', stage: 'ready' },
+    { tools, text: 'The requested work is finished\n[[COS_GOAL:COMPLETE]]', stage: 'no-reply' },
+    { tools, text: 'An answer without a marker', stage: 'failed' },
+    { tools, text: '[[COS_GOAL:CONTINUE]]\nThis text is after the marker', stage: 'failed' }
+  ]))('keeps Offline Goal terminal-marker authority after $tools attributed tools: $stage / $text', async ({ tools, text, stage }) => {
+    const id = `goal-tool-marker-${tools}-${stage}-${text.length}`;
+    const session = await createSession({ title: 'Useful Offline Goal work', conversationId: id });
+    await appendEvent(session.id, { source: 'extension', kind: 'user_message', time: 1000,
+      message: { text: 'Reconcile the evidence, then verify it', chars: 36, truncated: false } });
+    if (tools) await recordLoopMcpProof(session.id, 'useful-turn');
+    await appendEvent(session.id, { source: 'extension', kind: 'assistant_message', final: true,
+      turnId: 'useful-turn', messageId: 'useful-answer', time: Date.now(),
+      message: { text, chars: text.length, truncated: false } });
+    goal.startGoalDraft({ conversationId: id, sessionId: session.id, turnId: 'useful-turn' });
+    const draft = await settled(id);
+    expect(draft.stage).toBe(stage);
+    if (stage === 'failed') expect(draft).toMatchObject({ error: 'goal_marker_missing', retryable: false });
+    const answer = (await goal.conversationMessages(session.id)).filter(m => m.role === 'assistant').at(-1)?.content;
+    if (tools) expect(answer).toContain('[Chat On Steroids: 1 tool call ran in this turn. Arguments and results are not shown.]');
+    expect(fetch).not.toHaveBeenCalled();
+    expect(browser.request).not.toHaveBeenCalled();
+  });
   it('stops on exact completion and pauses for missing markers without guessing', async () => {
     for (const [id, text, stage] of [
       ['goal-template-stop', 'Finished\n[[COS_GOAL:COMPLETE]]', 'no-reply'],

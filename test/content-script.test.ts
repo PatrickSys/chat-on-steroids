@@ -23980,6 +23980,58 @@ describe('ordinary Continue native recovery', () => {
     expect(await check(initial)).toMatchObject({ safe: false });
   });
 
+  it.each(['current', 'denied', 'legacy-native', 'question', 'draft', 'stop', 'progress', 'tools'] as const)(
+    'commits repair in its owning document after native permission: %s', async scenario => {
+      let sourceTurn: unknown = null, work: unknown[] = [], pendingTools = 0;
+      live = await harness(`https://chatgpt.com/c/${chat}`, {
+        activity: () => ({ ok: true, data: { entries: [], stream: work,
+          nextSince: work.length ? 100 : 0, pendingTools, job: null } }),
+        repair_commit: async () => {
+          if (scenario === 'question') userTurn(live!.document, 'new-question', 'Keep this new work');
+          if (scenario === 'draft') live!.document.getElementById('prompt-textarea')!.textContent = 'Keep this draft';
+          if (scenario === 'stop') {
+            startGenerating(live!.document, { send: false });
+            const stop = live!.document.querySelector('[data-testid="stop-button"]')!;
+            Object.defineProperty(stop, 'getClientRects', { value: () => [{ width: 10, height: 10 }] });
+            live!.trustedClick(stop);
+          }
+          if (scenario === 'progress' || scenario === 'tools') {
+            work = [{ kind: 'page_tool', turnId: sourceTurn, messageId: 'new-work', label: 'Prepared another result', seq: 100, time: Date.now() }];
+            pendingTools = scenario === 'tools' ? 1 : 0;
+            await live!.hook.pullActivity();
+          }
+          return { ok: true, data: { allowed: scenario !== 'denied',
+            ...(scenario !== 'legacy-native' ? { committed: scenario !== 'denied' } : {}) } };
+        }
+      });
+      userTurn(live.document, 'source', 'Complete the task');
+      if (scenario === 'progress' || scenario === 'tools') startGenerating(live.document, { send: false });
+      live.hook.observe(); await settle();
+      sourceTurn = emitted(live.sent, 'turn_start').at(-1)?.event.turnId;
+      const expected = await live.runtimeMessage({ type: 'clf-repair-check', conversationId: chat });
+      let navigations = 0;
+      live.dom.virtualConsole.removeAllListeners('jsdomError');
+      live.dom.virtualConsole.on('jsdomError', error => {
+        if (error.message.includes('navigation')) navigations++;
+      });
+      const result = await live.runtimeMessage({ type: 'clf-repair-commit', conversationId: chat,
+        token: 'claimed-native-repair', expected });
+      expect(result).toMatchObject(scenario === 'current' ? { dispatched: true } : { safe: false });
+      expect(navigations).toBe(scenario === 'current' ? 1 : 0);
+      expect(live.sent.filter(message => message.type === 'repair_commit')).toHaveLength(1);
+    });
+
+  it('releases a failed inspection only when no native commit was attempted', async () => {
+    const ask = vi.fn();
+    const start = contentSource.indexOf('  async function commitRepairPage(');
+    const commit = new Function('inspectRepairPage', 'ask', 'conversationId', 'epoch',
+      `${contentSource.slice(start, contentSource.indexOf('\n  /**', start))}\nreturn commitRepairPage;`)(
+      async () => { throw new Error('page inspection unavailable'); }, ask, chat, 1);
+    expect(await commit({ conversationId: chat, token: 'claimed-token' }))
+      .toEqual({ safe: false, why: 'inspection-error' });
+    expect(ask).not.toHaveBeenCalled();
+  });
+
   it('treats a revised native label as the same work at the reload boundary', async () => {
     let work: unknown[] = [];
     live = await harness(`https://chatgpt.com/c/${chat}`, { activity: () => ({ ok: true,

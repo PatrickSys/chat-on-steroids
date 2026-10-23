@@ -11267,6 +11267,12 @@ describe('unattributed activity recovery', () => {
         expect((await validate()).body.allowed).toBe(state === 'current');
         // A validation is not a second claim and cannot refund a spent attempt.
         expect((await request('POST', '/repairs/claim', { body: { token: repair!.token } })).body.allowed).toBe(false);
+        const commit = (conversationId = PRIME) => request('POST', '/repairs/claim', {
+          body: { token: repair!.token, validate: true, commit: true, conversationId }
+        });
+        expect((await commit(OTHER)).body.allowed).toBe(false);
+        expect((await commit()).body.allowed).toBe(state === 'current');
+        expect((await commit()).body.allowed).toBe(false);
         if (state === 'history-limit') {
           await request('GET', `/status?repairFailed=${encodeURIComponent(repair!.token)}&repairAction=reloaded&why=deferred`);
           expect((await maintenanceBatch()).some(row => row.conversationId === PRIME)).toBe(false);
@@ -11283,7 +11289,7 @@ describe('unattributed activity recovery', () => {
     });
 
   it.each(['silence', 'unattributed'].flatMap(reason =>
-    ['current', 'history-limit', 'stopped'].map(state => ({ reason, state }))))(
+    ['current', 'history-limit', 'stopped', 'late-history-limit', 'late-stopped', 'page-progress', 'inspection-error', 'lost-response'].map(state => ({ reason, state }))))(
     'runs the production browser repair against native authority: $reason / $state', async ({ reason, state }) => {
       vi.useFakeTimers();
       try {
@@ -11305,14 +11311,33 @@ describe('unattributed activity recovery', () => {
         const handout = await maintenance();
         expect(handout).toMatchObject({ conversationId: PRIME, reason, requiresClaim: true });
         const gate = faultGate();
+        const finalPageGate = faultGate();
         const reload = vi.fn();
         const create = vi.fn();
         let receipts = 0;
         const tab = { id: 76, url: `https://chatgpt.com/c/${PRIME}` };
+        const content = readFileSync(new URL('../extension/content.js', import.meta.url), 'utf8');
+        const commit = vm.runInNewContext(`${content.slice(content.indexOf('  async function commitRepairPage('),
+          content.indexOf('\n  /**', content.indexOf('  async function commitRepairPage(')))}\ncommitRepairPage`, {
+          conversationId: PRIME, epoch: 1, location: { reload },
+          inspectRepairPage: async () => {
+            if (state.startsWith('late-')) await finalPageGate.hold();
+            if (state === 'inspection-error') throw new Error('inspection failed before commit');
+            return { safe: true, revision: 1, turnId: 'paired-authority', questionId: 'question' };
+          },
+          repairPageVerdict: () => state === 'page-progress'
+            ? { safe: false, why: 'changed', changed: 'progress', progressBy: 'app-page_tool' } : { safe: true },
+          ask: async (message: { token: string; conversationId: string }) => {
+            const result = await request('POST', '/repairs/claim', { body: {
+              token: message.token, conversationId: message.conversationId, validate: true, commit: true
+            } });
+            return { ok: result.status === 200, data: result.body };
+          }
+        });
         const source = readFileSync(new URL('../extension/background.js', import.meta.url), 'utf8');
-        const repair = vm.runInNewContext(`${source.slice(source.indexOf('async function performBrowserRepairs('),
+        const repair = vm.runInNewContext(`${source.slice(source.indexOf('function repairChangeDetail('),
           source.indexOf('\nfunction conversationStillOpen('))}\nperformBrowserRepairs`, {
-          tabConversations: { '76': PRIME }, tabDocuments: { '76': 'live-document' },
+          tabConversations: { '76': PRIME }, tabDocuments: { '76': 'live-document' }, tabEpochs: { '76': 0 },
           conversationForTab: (value: { url?: string }) => value.url?.split('/c/')[1] ?? null,
           createChatTab: create, CHATGPT_TAB_URLS: ['https://chatgpt.com/*'],
           chrome: { tabs: { query: async () => [tab], get: async () => tab, reload } },
@@ -11324,6 +11349,10 @@ describe('unattributed activity recovery', () => {
           },
           tabReply: async (_id: number, message: { type: string }) => {
             if (message.type === 'clf-page-status') { await gate.hold(); return undefined; }
+            if (message.type === 'clf-repair-commit') {
+              const result = await commit(message);
+              return state === 'lost-response' ? undefined : result;
+            }
             return { safe: true, revision: 1, turnId: 'paired-authority', questionId: 'question' };
           }
         });
@@ -11333,10 +11362,39 @@ describe('unattributed activity recovery', () => {
           turnId: 'paired-authority', recoverable: false, blocking: true, retryAt: Date.now() + 31_000,
           text: 'ChatGPT temporarily rate-limited loading this conversation history.' }]);
         if (state === 'stopped') await events(PRIME, [endTurn('paired-authority', 'stopped')]);
-        gate.release(); await running;
-        expect(reload).toHaveBeenCalledTimes(state === 'current' ? 1 : 0);
+        gate.release();
+        if (state.startsWith('late-')) {
+          await finalPageGate.entered;
+          if (state === 'late-stopped') await events(PRIME, [endTurn('paired-authority', 'stopped')]);
+          else await events(PRIME, [{ kind: 'chat_error', time: Date.now(), turnId: 'paired-authority', recoverable: false,
+            blocking: true, retryAt: Date.now() + 31_000, text: 'ChatGPT temporarily rate-limited loading this conversation history.' }]);
+          expect((await request('POST', '/repairs/claim', { body: { token: handout!.token, validate: true } })).body.allowed).toBe(false);
+          finalPageGate.release();
+        }
+        await running;
+        expect(reload).toHaveBeenCalledTimes(state === 'current' || state === 'lost-response' ? 1 : 0);
         expect(create).not.toHaveBeenCalled();
         expect(receipts).toBe(state === 'current' ? 1 : 0);
+        if (state === 'page-progress' || state === 'inspection-error') {
+          expect(getLog().some(entry => entry.message.includes('recovery deferred before any browser action'))).toBe(true);
+          const next = await maintenance();
+          expect(next, JSON.stringify(getLog().slice(-8))).toMatchObject({ conversationId: PRIME, reason });
+          expect(next!.token).not.toBe(handout!.token);
+          expect((await request('POST', '/repairs/claim', { body: { token: handout!.token,
+            conversationId: PRIME, validate: true, commit: true } })).body.allowed).toBe(false);
+          expect((await request('POST', '/repairs/claim', { body: { token: next!.token } })).body.allowed).toBe(true);
+          const replacement = { token: next!.token, conversationId: PRIME, validate: true, commit: true };
+          expect((await request('POST', '/repairs/claim', { body: replacement })).body)
+            .toMatchObject({ allowed: true, committed: true });
+          expect((await request('POST', '/repairs/claim', { body: replacement })).body.allowed).toBe(false);
+        }
+        if (state === 'lost-response') {
+          expect((await request('POST', '/repairs/claim', { body: { token: handout!.token,
+            conversationId: PRIME, validate: true, commit: true } })).body.allowed).toBe(false);
+          await repair([handout], {});
+          expect(reload).toHaveBeenCalledTimes(1);
+          expect(await maintenance()).toBeNull();
+        }
         if (state !== 'current') {
           const input = await import('../src/main/session/input.js');
           const session = (await findSessionByConversation(PRIME))!;

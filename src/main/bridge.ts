@@ -2968,10 +2968,14 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const token = 'token' in body ? body.token : null;
     if ('validate' in body && typeof body.validate !== 'boolean') return json(res, 400, { error: 'bad_request' }, origin);
     const validating = 'validate' in body && body.validate === true;
+    if ('commit' in body && (typeof body.commit !== 'boolean' || !validating)) return json(res, 400, { error: 'bad_request' }, origin);
+    const committing = 'commit' in body && body.commit === true;
     if (typeof token !== 'string' || token.length > 128) return json(res, 400, { error: 'bad_request' }, origin);
     const found = [...repairsInFlight].find(([, repair]) => repairNeedsClaim(repair) && repair.token === token && repair.state === 'handed');
     if (!found) return json(res, 200, { allowed: false }, origin);
     const [conversationId, repair] = found;
+    if (committing && (!('conversationId' in body) || body.conversationId !== conversationId))
+      return json(res, 200, { allowed: false }, origin);
     const session = await getSession(repair.sessionId);
     // A Compact & resume the user pressed may act on the chat they closed: handout and claim agree.
     const current = session?.conversationId === conversationId && departureAllowsRepairFor(session, repair.reason, repair.episode) &&
@@ -2985,14 +2989,16 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const allowed = current && observationWritesInFlight === 0 && repairsInFlight.get(conversationId) === repair &&
       repair.state === 'handed' && Date.now() >= repair.notBefore && providerHistoryBackoff(conversationId) === null &&
       !isChatBlocked(conversationId) && !stopRequestedFor(conversationId) &&
-      (validating ? repair.claimed === true : !repair.claimed);
+      (validating ? repair.claimed === true : !repair.claimed) && (!committing || repair.committedToken !== token);
+    // This exact action may cross into the browser once. A lost response never buys another commit.
+    if (allowed && committing) repair.committedToken = token;
     // Validation observes the already claimed action; it never grants another one.
     if (allowed && !validating) {
       repair.claimed = true;
       if (repair.reason === 'assistant-error' && repair.assistantSource)
         turnRepairSpent.set(conversationId, { sessionId: repair.sessionId, turnKey: repair.assistantSource.key, token, at: Date.now() });
     }
-    return json(res, 200, { allowed }, origin);
+    return json(res, 200, { allowed, ...(committing ? { committed: allowed } : {}) }, origin);
   }
 
   if (route === '/correlations' && req.method === 'POST') {
@@ -7801,6 +7807,7 @@ interface Repair {
   assistantSource?: { key: string; turnId: string | null; completed: boolean };
   attribution?: { incident: UnattributedIncident; candidate: UnattributedCandidate };
   claimed?: boolean;
+  committedToken?: string;
   /**
    * How many times this exact repair has been offered to a browser that never claimed it.
    *
@@ -10355,11 +10362,14 @@ async function failRepairAttempt(
     // instead of ending it. Nothing failed, so it is neither a warning nor a "Reload failed" row.
     const streaming = why === 'streaming';
     const deferred = why === 'deferred';
+    const hold = changeDetail === 'inspection-error' ? 'page inspection failed before commit'
+      : changeDetail && Object.hasOwn(REPAIR_HOLD_REASONS, changeDetail) ? REPAIR_HOLD_REASONS[changeDetail]
+      : repairChangeDetail(changeDetail) ?? 'app authority changed';
     if (streaming) {
       if (!repair.awaitingStream)
         logInfo(`bridge: ChatGPT is answering again in ${conversationId}; the ${repair.reason} repair waits until it finishes`);
     } else if (deferred) {
-      logInfo(`bridge: recovery deferred before any browser action for ${conversationId}; app authority changed`);
+      logInfo(`bridge: recovery deferred before any browser action for ${conversationId}; ${hold}`);
     } else {
       const exact = why === 'changed' ? repairChangeDetail(changeDetail) : null;
       const detail = why && Object.hasOwn(REPAIR_FAIL_REASONS, why) ? `: ${REPAIR_FAIL_REASONS[why]}${exact ? ` — ${exact}` : ''}` : '';
@@ -10370,7 +10380,7 @@ async function failRepairAttempt(
       conversationId,
       repair,
       deferred
-        ? 'Browser recovery deferred before any browser action; app authority changed.'
+        ? `Browser recovery deferred before any browser action; ${hold}.`
         : streaming
         ? repair.attribution ? 'Not reloaded: ChatGPT is answering.' : 'ChatGPT is answering again; recovery waits until it finishes.'
         : `${action === 'reopened' ? 'Reopen' : action === 'resumed' ? 'Resume' : 'Reload'} failed while ${repairPurpose(repair).during}${repair.attribution ? '.' : '; will retry.'}`

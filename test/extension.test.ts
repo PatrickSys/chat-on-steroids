@@ -16,11 +16,13 @@ const { APP_VERSION, BRIDGE_PROTOCOL } = await import('../src/main/version.js');
 
 let domSource = '';
 let backgroundSource = '';
+let contentSource = '';
 
 beforeAll(async () => {
-  [domSource, backgroundSource] = await Promise.all([
+  [domSource, backgroundSource, contentSource] = await Promise.all([
     fs.readFile(path.join(process.cwd(), 'extension', 'chatgpt-dom.js'), 'utf8'),
-    fs.readFile(path.join(process.cwd(), 'extension', 'background.js'), 'utf8')
+    fs.readFile(path.join(process.cwd(), 'extension', 'background.js'), 'utf8'),
+    fs.readFile(path.join(process.cwd(), 'extension', 'content.js'), 'utf8')
   ]);
   backgroundSource = backgroundSource.replace(/\r\n/g, '\n');
 });
@@ -551,9 +553,30 @@ function loadWorker(options: {
     if (tab && typeof properties.autoDiscardable === 'boolean') tab.autoDiscardable = properties.autoDiscardable;
     return { id, windowId: 7, ...properties };
   });
-  const tabsSendMessage = vi.fn(options.tabsSendMessage ?? (async () => ({ ok: true })));
+  const pageReply = options.tabsSendMessage ?? (async () => ({ ok: true }));
+  const tabsSendMessage = vi.fn(async (tabId: number, message: Record<string, unknown>, target?: { documentId?: string }) => {
+    if (message.type !== 'clf-repair-commit') return pageReply(tabId, message);
+    // Keep the original reload assertions. The browser fake now dispatches the
+    // shipped content action; its page verdict is supplied by each existing fixture.
+    // Real synchronous DOM/progress fences are independently exercised in content-script.test.ts.
+    let verdict: unknown;
+    const start = contentSource.indexOf('  async function commitRepairPage(');
+    const commit = vm.runInNewContext(`${contentSource.slice(start, contentSource.indexOf('\n  /**', start))}\ncommitRepairPage`, {
+      conversationId: message.conversationId, epoch: 0,
+      inspectRepairPage: () => pageReply(tabId, { ...message, type: 'clf-repair-check' }),
+      repairPageVerdict: () => verdict,
+      location: { reload: () => { void tabsReload(tabId); } },
+      ask: async (request: Record<string, unknown>) => {
+        const result = await new Promise(resolve => listener!(request,
+          { tab: { id: tabId }, documentId: target?.documentId ?? documentFor(tabId), frameId: 0 }, resolve));
+        verdict = await pageReply(tabId, { ...message, type: 'clf-repair-check' });
+        return result;
+      }
+    });
+    return commit(message);
+  });
   const tabsRemove = vi.fn(async () => undefined);
-  const tabsReload = vi.fn(async () => undefined);
+  const tabsReload = vi.fn(async (_id: number) => undefined);
   const scriptingExecuteScript = vi.fn(async () => []);
   const scriptingInsertCSS = vi.fn(async () => undefined);
   const alarmCreate = vi.fn(() => undefined);
@@ -1061,12 +1084,12 @@ it.each(['still-frozen', 'woke', 'navigated', 'new-document'] as const)(
         claimed = true;
         if (state === 'new-document') documents['71'] = 'replacement-document';
       }
-      return { ok: true, data: { allowed: true } };
+      return { ok: true, data: { allowed: true, committed: true } };
     });
     const source = backgroundSource.slice(backgroundSource.indexOf('async function performBrowserRepairs('),
       backgroundSource.indexOf('\nfunction conversationStillOpen('));
     const repair = vm.runInNewContext(`${source}\nperformBrowserRepairs`, {
-      tabConversations: { '71': conversationId }, tabDocuments: documents,
+      tabConversations: { '71': conversationId }, tabDocuments: documents, tabEpochs: { '71': 0 },
       conversationForTab: (value: { url?: string }) => value.url?.split('/c/')[1] ?? null,
       createChatTab: vi.fn(), call,
       chrome: { tabs: { query: async () => [tab], reload, get: async () => ({ ...tab,
@@ -1400,8 +1423,8 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
           trace.push(validating ? 'validate' : 'claim');
           if (!validating && mode === 'navigated-during-claim') navigated = true;
           expect(init.method).toBe('POST');
-          expect(JSON.parse(String(init.body))).toEqual({ token: 'attribution-attempt', ...(validating ? { validate: true } : {}) });
-          return mode === 'claim-unavailable' ? response(503, {}) : response(200, { allowed: !resolved });
+          expect(JSON.parse(String(init.body))).toEqual({ token: 'attribution-attempt', ...(validating ? { validate: true, commit: true, conversationId: CHAT } : {}) });
+          return mode === 'claim-unavailable' ? response(503, {}) : response(200, { allowed: !resolved, committed: validating && !resolved });
         }
         if (url.pathname === '/status') {
           if (url.searchParams.has('repaired')) trace.push('repaired');
@@ -1518,7 +1541,7 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
       const fetch = vi.fn(async (input: string) => {
         const url = new URL(input);
         if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
-        if (url.pathname === '/repairs/claim') { claimed = true; return response(200, { allowed: true }); }
+        if (url.pathname === '/repairs/claim') { claimed = true; return response(200, { allowed: true, committed: true }); }
         if (url.pathname === '/status') {
           if (url.searchParams.has('repaired')) receipts++;
           if (armed && !handed) { handed = true; return response(200, { repairs: [{ conversationId: CHAT,
@@ -1561,7 +1584,7 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
       if (url.pathname === '/repairs/claim') {
         if (JSON.parse(String(init?.body ?? '{}')).validate === true) {
           pageChanged = state === 'page-progress';
-          return response(200, { allowed: claimed && !revoked });
+          return response(200, { allowed: claimed && !revoked, committed: claimed && !revoked });
         }
         claimed = true; return response(200, { allowed: true });
       }
@@ -1604,7 +1627,7 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
       const fetch = vi.fn(async (input: string) => {
         const url = new URL(input);
         if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
-        if (url.pathname === '/repairs/claim') { claimed = true; return response(200, { allowed: true }); }
+        if (url.pathname === '/repairs/claim') { claimed = true; return response(200, { allowed: true, committed: true }); }
         if (url.pathname === '/status') {
           if (url.searchParams.has('repaired')) receipts++;
           if (armed && !handed) { handed = true; return response(200, { repairs: [{ conversationId: CHAT,
@@ -1651,7 +1674,7 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
     const fetch = vi.fn(async (input: string) => {
       const url = new URL(input);
       if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
-      if (url.pathname === '/repairs/claim') { claimed = true; return response(200, { allowed: true }); }
+      if (url.pathname === '/repairs/claim') { claimed = true; return response(200, { allowed: true, committed: true }); }
       if (url.pathname === '/status') {
         if (url.searchParams.has('repairFailed')) failures.push(url.searchParams.get('detail'));
         if (armed && !handed) { handed = true; return response(200, { repairs: [{ conversationId: CHAT,
@@ -1686,7 +1709,7 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
       const fetch = vi.fn(async (input: string) => {
         const url = new URL(input);
         if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
-        if (url.pathname === '/repairs/claim') { claimed = true; return response(200, { allowed: true }); }
+        if (url.pathname === '/repairs/claim') { claimed = true; return response(200, { allowed: true, committed: true }); }
         if (url.pathname === '/status') {
           if (url.searchParams.has('repaired')) repaired++;
           if (url.searchParams.has('repairFailed')) failed++;
@@ -1720,7 +1743,7 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
       expect(repaired).toBe(reloads);
       expect(claimed).toBe(scenario !== 'draft-before-claim');
       expect(failed).toBe(scenario === 'draft-after-claim' || scenario === 'question-after-claim' ? 1 : 0);
-      expect(checks).toHaveLength(claimed ? (reloads ? 3 : 2) : 1);
+      expect(checks).toHaveLength(claimed ? (scenario === 'empty' ? 4 : reloads ? 3 : 2) : 1);
       expect(checks.every(message => message.draftOnly === true)).toBe(true);
       if (claimed && scenario !== 'unresponsive') expect(checks[1]!.expected)
         .toEqual({ revision: 1, turnId: 'source', questionId: 'question' });

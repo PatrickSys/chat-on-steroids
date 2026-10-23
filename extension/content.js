@@ -13044,8 +13044,7 @@
     return false;
   }
 
-  async function inspectRepairPage(message) {
-    const target = conversationId, forEpoch = epoch;
+  function repairPageVerdict(message, target, forEpoch) {
     const current = () => alive && target === message.conversationId && conversationId === target &&
       CLF_DOM.conversationId() === target && epoch === forEpoch;
     // An exact compaction ticket may recover its own busy page. It still cannot
@@ -13069,9 +13068,6 @@
     }
     if (!current()) return { safe: false, why: 'page-changed' };
     if (stopRequestedAt) return { safe: false, why: 'stop-requested' };
-    const source = currentAssistantTurn();
-    if (source) await refreshFiber({ pageTurnId: source.id, pageTurn: source.node || source.nodes?.[0] });
-    await flush();
     const questionId = CLF_DOM.messages().filter(row => row.role === 'user').at(-1)?.id ?? null;
     const expected = message.expected;
     // Which part moved since the first check, and for progress what moved it, so a refused
@@ -13083,6 +13079,33 @@
       [changed, 'changed']],
     { revision: turnProgressRevision, turnId, questionId,
       ...(changed ? { changed, ...(changed === 'progress' && turnProgressSource ? { progressBy: turnProgressSource } : {}) } : {}) });
+  }
+
+  async function inspectRepairPage(message) {
+    const target = conversationId, forEpoch = epoch;
+    if (message.draftOnly === true || !alive || target !== message.conversationId || stopRequestedAt)
+      return repairPageVerdict(message, target, forEpoch);
+    const source = currentAssistantTurn();
+    if (source) await refreshFiber({ pageTurnId: source.id, pageTurn: source.node || source.nodes?.[0] });
+    await flush();
+    return repairPageVerdict(message, target, forEpoch);
+  }
+
+  async function commitRepairPage(message) {
+    const target = conversationId, forEpoch = epoch;
+    let checked;
+    try { checked = await inspectRepairPage(message); }
+    catch { return { safe: false, why: 'inspection-error' }; }
+    if (checked.safe !== true) return checked;
+    const permission = await ask({ type: 'repair_commit', conversationId: target, token: message.token });
+    if (!permission?.ok || permission.data?.allowed !== true || permission.data?.committed !== true)
+      return { safe: false, why: 'deferred' };
+    // Native permission commits the action. No awaited page probe may follow it:
+    // this document owns both the final progress/draft/Stop check and navigation.
+    const current = repairPageVerdict({ ...message, expected: message.expected || checked }, target, forEpoch);
+    if (current.safe !== true) return current;
+    location.reload();
+    return { dispatched: true };
   }
 
   /**
@@ -14199,6 +14222,10 @@
       }
       if (message.type === 'clf-repair-check') {
         void inspectRepairPage(message).then(sendResponse).catch(() => sendResponse({ safe: false }));
+        return true;
+      }
+      if (message.type === 'clf-repair-commit') {
+        void commitRepairPage(message).then(sendResponse).catch(() => sendResponse({ safe: false, why: 'error' }));
         return true;
       }
       if (message.type === 'clf-image-export') {

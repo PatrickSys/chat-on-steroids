@@ -3527,7 +3527,9 @@ async function performBrowserRepairs(repairs, policy) {
     const repairAction = target ? 'reloaded' : 'reopened';
     try {
       const documentId = target ? tabDocuments[String(target.id)] : null;
+      const navigationEpoch = target && requiresClaim ? tabEpochs[String(target.id)] : null;
       let validateRepair = null;
+      let pageCheck = null;
       // Suspension grants a reload of a still-suspended shell, never a new tab.
       if (suspended) {
         if (!target) continue;
@@ -3558,6 +3560,7 @@ async function performBrowserRepairs(repairs, policy) {
         const draftOnly = reason === 'compaction';
         const check = inspectTurn ? await tabReply(target.id,
           { type: 'clf-repair-check', conversationId, draftOnly }, documentId ? { documentId } : undefined) : null;
+        pageCheck = check;
         if (check?.safe === false) {
           // The repair stays handed for the next pass; the app logs once why the page held it.
           await call(`/status?repairHeld=${encodeURIComponent(token)}&why=${encodeURIComponent(check.why || 'unknown')}`);
@@ -3654,16 +3657,23 @@ async function performBrowserRepairs(repairs, policy) {
           continue;
         }
       }
-      // Page probes can outlive app-side Stop, a provider history hold, or the source
-      // obligation. Validate the existing claim, without buying another attempt.
-      if (requiresClaim) {
-        const valid = await call('/repairs/claim', { method: 'POST', body: JSON.stringify({ token, validate: true }) });
-        if (!valid.ok || valid.data?.allowed !== true) {
-          await call(`/status?repairFailed=${encodeURIComponent(token)}&repairAction=${repairAction}&why=deferred`);
-          continue;
+      if (requiresClaim && target && !suspended && pageCheck?.safe === true) {
+        // The responsive document finishes its awaited inspection, commits native
+        // authority, and synchronously fences local progress before navigating.
+        // A missing response may mean it already navigated: never reload as fallback.
+        let result = null;
+        try {
+          result = await tabReply(target.id, { type: 'clf-repair-commit', conversationId, token,
+            draftOnly: reason === 'compaction', expected: pageCheck }, documentId ? { documentId } : undefined);
+        } catch { /* The claimed action stays spent when its dispatch is unknown. */ }
+        if (result?.dispatched === true) {
+          await call(`/status?repaired=${encodeURIComponent(token)}&repairAction=${repairAction}`);
+        } else if (result?.safe === false && result.why !== 'error') {
+          const detail = result.why === 'changed' ? repairChangeDetail(result) : result.why || 'unknown';
+          await call(`/status?repairFailed=${encodeURIComponent(token)}&repairAction=${repairAction}&why=deferred&detail=${encodeURIComponent(detail)}`);
         }
+        continue;
       }
-      // Validation itself yields. Keep the page/document/progress fence last too.
       if (validateRepair && !await validateRepair()) continue;
       if (target && suspended && requiresClaim) {
         const tab = await chrome.tabs.get(target.id);
@@ -3674,6 +3684,14 @@ async function performBrowserRepairs(repairs, policy) {
           await call(`/status?repairFailed=${encodeURIComponent(token)}&repairAction=${repairAction}&why=changed&detail=${encodeURIComponent(changed)}`);
           continue;
         }
+      }
+      if (requiresClaim) {
+        const valid = await call('/repairs/claim', { method: 'POST', body: JSON.stringify({ token, validate: true, commit: true, conversationId }) });
+        if (!valid.ok || valid.data?.allowed !== true || valid.data?.committed !== true) {
+          await call(`/status?repairFailed=${encodeURIComponent(token)}&repairAction=${repairAction}&why=deferred`);
+          continue;
+        }
+        if (target && (tabDocuments[String(target.id)] !== documentId || tabEpochs[String(target.id)] !== navigationEpoch)) continue;
       }
       if (target) await chrome.tabs.reload(target.id);
       else {
@@ -4541,6 +4559,18 @@ const HANDLERS = {
     });
     return await current() ? result : { ok: false, error: 'stale_document' };
   },
+  async repair_commit(message, _sender, source) {
+    await load();
+    if (!ownsDocument(source) || typeof message.token !== 'string' || message.token.length > 128)
+      return { ok: false, error: 'stale_document' };
+    const tab = await chrome.tabs.get(source.tab).catch(() => null);
+    if (!ownsDocument(source) || !tab || tab.pendingUrl || conversationForTab(tab) !== message.conversationId)
+      return { ok: false, error: 'wrong_conversation' };
+    const result = await call('/repairs/claim', { method: 'POST', body: JSON.stringify({
+      token: message.token, conversationId: message.conversationId, validate: true, commit: true
+    }) });
+    return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
+  },
   /** Repair both sides of the reader protocol in this exact browser document. */
   async repair_fiber(_message, _sender, source) {
     await load();
@@ -5014,6 +5044,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     'settings_set',
     'settings_get',
     'repair_fiber',
+    'repair_commit',
     'redeem',
     'command_step',
     'defer_revival',

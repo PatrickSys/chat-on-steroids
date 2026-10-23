@@ -3233,6 +3233,14 @@ still requires independent validation. These checks use existing RPC and repair 
 When a later page-status or compaction-resume probe yields, repeat that same exact
 document/question/progress fence before reloading. The probe cannot extend an old claim
 across navigation, document replacement or newly observed work.
+Responsive repair dispatch belongs to that exact content document. Finish its awaited
+inspection, commit the claimed token once through the native owner, then check the local
+question/progress/Stop/tools/draft state synchronously before `location.reload()`. Native
+commit is the authorization boundary; later cross-process cancellation cannot undo an
+already committed action. Require the explicit commit receipt so an older native bridge
+cannot silently accept half this protocol. Missing dispatch responses never authorize a
+fallback reload or another commit. Proven pre-action vetoes defer without spending a reload;
+any later offer uses a fresh token and the original episode/deadline.
 A veto names its reason (`why`: page-changed, stop-requested, tool-running, sending, page-busy,
 compaction, draft, changed). The extension reports it with `/status?repairHeld=<token>&why=`, which
 hands nothing out and changes no repair; the app logs each token and reason once (#820).

@@ -491,7 +491,7 @@ describe('direct browser control over the paired bridge', () => {
       const claimed = await request('POST', '/browser-control', { body: { ...claim,
         owners: [`request:${requestId}`, `request:${foreignRequest}`, 'request:unproved']
       } });
-      expect(claimed.status).toBe(200);
+      expect(claimed.status, JSON.stringify(claimed.body)).toBe(200);
       expect(claimed.body.command).toMatchObject({ owner: `session:${session.id}`, conversationId: resumed,
         ownerAliases: [`request:${requestId}`] });
       expect((await request('POST', '/browser-control', { body: { ...claim, action: 'result', result: { value: true } } })).status).toBe(200);
@@ -6205,7 +6205,7 @@ describe('delivering a bootstrap', () => {
       const claimed = await request('POST', '/commands/redeem', {
         body: { id, client: 'claimed-revival-document', conversationId }
       });
-      expect(claimed.status).toBe(200);
+      expect(claimed.status, JSON.stringify(claimed.body)).toBe(200);
       expect(swarmState().agents.find((agent) => agent.id === 'worker-1')).toMatchObject({
         state: 'waking',
         revivable: false
@@ -15931,6 +15931,373 @@ describe('the goal loop over the bridge', () => {
     expect(await snapshot()).toMatchObject({ replies: expect.arrayContaining([
       expect.objectContaining({ conversationId: chat, replyId: 'offline-goal-tombstone-final', state: 'handled', staleObjective: true })
     ]) });
+  });
+
+  it('rejects changed Offline Goal objectives with duplicate current sessions before mutation', async () => {
+    await pair();
+    const chat = 'cafe0225-0000-4000-8000-000000000225';
+    await saveConfig({
+      ...suiteConfig,
+      sessions: { ...suiteConfig.sessions, record: true },
+      goal: { ...suiteConfig.goal, backend: 'templates', enabled: false }
+    });
+    expect((await request('POST', '/events', { body: { conversationId: chat, events: [
+      { kind: 'user_message', time: Date.now(), messageId: 'ambiguous-A-user', text: 'Do A' }
+    ] } })).status).toBe(200);
+    expect((await request('POST', '/goal/objective', {
+      body: { conversationId: chat, text: 'Do A', mode: 'goal' }
+    })).status).toBe(200);
+    expect((await request('POST', '/events', { body: { conversationId: chat, events: [
+      { kind: 'turn_start', time: Date.now(), turnId: 'ambiguous-active-A' }
+    ] } })).status).toBe(200);
+    expect((await request('POST', '/settings', { body: { conversationId: chat, goal: false } })).status).toBe(200);
+    const objective = goalObjectiveFor(chat);
+    const held = goalSwitchFor(chat);
+    const durableObjective = await readDurable(GOAL_OBJECTIVES_STATE);
+    const durableSwitch = await readDurable(GOAL_SWITCHES_STATE);
+    const replies = await readDurable(GOAL_REPLIES_STATE);
+    await createSession({ conversationId: chat, title: 'Duplicate current owner' });
+    expect(await findSessionByConversation(chat, { requireUnique: true })).toBeNull();
+    expect(await findSessionByConversation(chat)).not.toBeNull();
+    const result = await request('POST', '/goal/objective', {
+      body: { conversationId: chat, text: 'Do B', mode: 'goal' }
+    });
+    expect(result.status, JSON.stringify(result.body)).toBe(503);
+    expect(result.body.error).toBe('goal_source_ambiguous');
+    expect(goalObjectiveFor(chat)).toBe(objective);
+    expect(goalSwitchFor(chat)).toEqual(held);
+    expect(await readDurable(GOAL_OBJECTIVES_STATE)).toEqual(durableObjective);
+    expect(await readDurable(GOAL_SWITCHES_STATE)).toEqual(durableSwitch);
+    expect(await readDurable(GOAL_REPLIES_STATE)).toEqual(replies);
+  });
+
+  it.each([
+    ['stable', 'COMPLETE', '0201'],
+    ['stable', 'CONTINUE', '0202'],
+    ['provisional', 'COMPLETE', '0203'],
+    ['provisional', 'CONTINUE', '0204']
+  ])('rejects an in-flight old Offline Goal %s %s final after an objective change', async (path, marker, suffix) => {
+    await pair();
+    const chat = 'cafe' + suffix + '-0000-4000-8000-000000000' + suffix.slice(1);
+    const oldTurn = 'offline-handover-old-' + suffix;
+    await saveConfig({
+      ...suiteConfig,
+      sessions: { ...suiteConfig.sessions, record: true },
+      goal: { ...suiteConfig.goal, backend: 'templates', enabled: false }
+    });
+    const opened = await request('POST', '/events', { body: { conversationId: chat, events: [
+      { kind: 'user_message', time: Date.now(), messageId: 'handover-user-' + suffix, text: 'Finish objective A' }
+    ] } });
+    expect(opened.status).toBe(200);
+    expect((await request('POST', '/goal/objective', {
+      body: { conversationId: chat, text: 'Finish objective A', mode: 'goal' }
+    })).status).toBe(200);
+    expect((await request('POST', '/events', { body: { conversationId: chat, events: [
+      { kind: 'turn_start', time: Date.now(), turnId: oldTurn }
+    ] } })).status).toBe(200);
+    expect((await request('POST', '/goal/objective', {
+      body: { conversationId: chat, text: 'Inspect objective B instead', mode: 'goal' }
+    })).status).toBe(200);
+    expect(goalPendingReplyFor(chat)).toBeNull();
+    // The exact source-turn fence must survive restart before its late final arrives.
+    const committedFence = await readDurable<GoalRepliesSnapshot>(GOAL_REPLIES_STATE);
+    expect(committedFence).toMatchObject({ replies: expect.arrayContaining([
+      expect.objectContaining({ conversationId: chat, turnId: oldTurn, state: 'handled', staleObjective: true })
+    ]) });
+    const { restoreGoalReplies } = await import('../src/main/goal.js');
+    restoreGoalReplies(committedFence);
+    if (path === 'stable' && marker === 'CONTINUE') {
+      expect((await request('POST', '/settings', { body: { conversationId: chat, goal: false } })).status).toBe(200);
+      expect((await request('POST', '/settings', { body: { conversationId: chat, goal: true } })).status).toBe(200);
+      expect(goalPendingReplyFor(chat)).toBeNull();
+    }
+
+    const result = await request('POST', '/events', { body: { conversationId: chat, events: [
+      { kind: 'turn_end', time: Date.now(), turnId: oldTurn, outcome: 'completed' },
+      ...(path === 'stable' ? [{
+        kind: 'assistant_message', time: Date.now(), messageId: 'handover-old-final-' + suffix, turnId: oldTurn,
+        text: 'Objective A finished.\n[[COS_GOAL:' + marker + ']]',
+        state: 'final', final: true, goalEligible: true, activeNow: true
+      }] : [])
+    ] } });
+    expect(result.status).toBe(200);
+    if (path === 'provisional') {
+      const attempted = await request('POST', '/goal/draft', {
+        body: { conversationId: chat, turnId: oldTurn, clientId: 'handover-client-' + suffix }
+      });
+      expect(attempted.status).toBe(409);
+      // A later canonical stable final must remain rejected even after the provisional attempt.
+      expect((await request('POST', '/events', { body: { conversationId: chat, events: [
+        { kind: 'assistant_message', time: Date.now(), messageId: 'handover-old-final-' + suffix, turnId: oldTurn,
+          text: 'Objective A finished.\n[[COS_GOAL:' + marker + ']]',
+          state: 'final', final: true, goalEligible: true, activeNow: true }
+      ] } })).status).toBe(200);
+    }
+    // A terminal reply from the pre-change turn cannot create B's Goal debt.
+    expect(goalPendingReplyFor(chat)).toBeNull();
+    expect((await request('GET', '/activity?conversationId=' + chat)).body.goal.pending).toBeNull();
+  });
+
+  it.each([
+    ['stable', 'COMPLETE', 'CONTINUE', '0211'],
+    ['stable', 'CONTINUE', 'COMPLETE', '0212'],
+    ['provisional', 'COMPLETE', 'CONTINUE', '0213'],
+    ['provisional', 'CONTINUE', 'COMPLETE', '0214']
+  ])('keeps a fresh B %s %s Goal obligation when older A finishes with %s later', async (bKind, bMarker, aMarker, suffix) => {
+    await pair();
+    const chat = 'cafe' + suffix + '-0000-4000-8000-000000000' + suffix.slice(1);
+    const aTurn = 'handover-source-A-' + suffix;
+    const bTurn = 'handover-source-B-' + suffix;
+    const bFinal = bKind === 'stable' ? 'handover-B-final-' + suffix : 'turn:' + bTurn;
+    const clientId = 'handover-B-client-' + suffix;
+    await saveConfig({
+      ...suiteConfig,
+      sessions: { ...suiteConfig.sessions, record: true },
+      goal: { ...suiteConfig.goal, backend: 'templates', enabled: false }
+    });
+    const created = await request('POST', '/events', { body: { conversationId: chat, events: [
+      { kind: 'user_message', time: Date.now(), messageId: 'handover-A-user-' + suffix, text: 'Finish objective A' }
+    ] } });
+    expect(created.status).toBe(200);
+    const sessionId = created.body.sessionId as string;
+    expect((await request('POST', '/goal/objective', {
+      body: { conversationId: chat, text: 'Finish objective A', mode: 'goal' }
+    })).status).toBe(200);
+    expect((await request('POST', '/events', { body: { conversationId: chat, events: [
+      { kind: 'turn_start', time: Date.now(), turnId: aTurn }
+    ] } })).status).toBe(200);
+    expect((await request('POST', '/goal/objective', {
+      body: { conversationId: chat, text: 'Inspect objective B', mode: 'goal' }
+    })).status).toBe(200);
+    expect(goalPendingReplyFor(chat)).toBeNull();
+    if (bKind === 'provisional') {
+      // The old A turn finished at the page, but its stable assistant event is
+      // delayed until after B. This lets the real B provisional endpoint run.
+      expect((await request('POST', '/events', { body: { conversationId: chat, events: [
+        { kind: 'turn_end', time: Date.now(), turnId: aTurn, outcome: 'completed' }
+      ] } })).status).toBe(200);
+    }
+
+    const bEvents = [
+      { kind: 'user_message', time: Date.now(), messageId: 'handover-B-user-' + suffix, text: 'Inspect objective B' },
+      { kind: 'turn_start', time: Date.now(), turnId: bTurn },
+      { kind: 'turn_end', time: Date.now(), turnId: bTurn, outcome: 'completed' },
+      ...(bKind === 'stable' ? [{
+        kind: 'assistant_message', time: Date.now(), messageId: bFinal, turnId: bTurn,
+        text: 'B response.\n[[COS_GOAL:' + bMarker + ']]',
+        state: 'final', final: true, goalEligible: true, activeNow: true
+      }] : [])
+    ];
+    expect((await request('POST', '/events', { body: { conversationId: chat, events: bEvents } })).status).toBe(200);
+    if (bKind === 'provisional') {
+      // Recorder has a completed canonical B final, but Fiber has not yet
+      // published goalEligible: /goal/draft must durably accept turn:B first.
+      await recordFinalForTest(chat, bTurn);
+      const claimed = await request('POST', '/goal/draft', {
+        body: { conversationId: chat, turnId: bTurn, clientId }
+      });
+      expect(claimed.status, JSON.stringify(claimed.body)).toBe(200);
+    }
+    const bBefore = goalPendingReplyFor(chat);
+    expect(bBefore).toMatchObject({ replyId: bFinal, turnId: bTurn });
+    const ledger = await readDurable<GoalRepliesSnapshot>(GOAL_REPLIES_STATE);
+    expect(ledger).toMatchObject({ replies: expect.arrayContaining([
+      expect.objectContaining({ conversationId: chat, replyId: bFinal, turnId: bTurn, state: 'pending' })
+    ]) });
+    // Persisted B must remain authoritative across a native restore.
+    if (aMarker === 'COMPLETE') {
+      const { restoreGoalReplies } = await import('../src/main/goal.js');
+      restoreGoalReplies(ledger);
+      expect(goalPendingReplyFor(chat)).toMatchObject({ replyId: bFinal, turnId: bTurn });
+    }
+
+    // A's old final is delivered AFTER B and gets a later native eventSeq.
+    const late = await request('POST', '/events', { body: { conversationId: chat, events: [
+      ...(bKind === 'stable' ? [{ kind: 'turn_end', time: Date.now(), turnId: aTurn, outcome: 'completed' }] : []),
+      { kind: 'assistant_message', time: Date.now(), messageId: 'handover-A-late-' + suffix, turnId: aTurn,
+        text: 'A response.\n[[COS_GOAL:' + aMarker + ']]',
+        state: 'final', final: true, goalEligible: true, activeNow: false }
+    ] } });
+    expect(late.status).toBe(200);
+    // Neither re-arm A as B nor overwrite/delete a legitimate B obligation.
+    expect(goalPendingReplyFor(chat)).toEqual(bBefore);
+    const after = await readDurable<GoalRepliesSnapshot>(GOAL_REPLIES_STATE);
+    expect(after).toMatchObject({ replies: expect.arrayContaining([
+      expect.objectContaining({ conversationId: chat, replyId: bFinal, turnId: bTurn,
+        eventSeq: bBefore!.eventSeq, acceptedAt: bBefore!.acceptedAt, state: 'pending' })
+    ]) });
+    expect((await request('GET', '/activity?conversationId=' + chat)).body.goal.pending)
+      .toMatchObject({ replyId: bFinal, turnId: bTurn });
+
+    // B's own page still holds the right to collect exactly its own turn.
+    const picked = await request('POST', '/goal/draft', {
+      body: { conversationId: chat, turnId: bTurn, clientId }
+    });
+    expect(picked.status, JSON.stringify(picked.body)).toBe(200);
+    expect((await readDurable<GoalRepliesSnapshot>(GOAL_REPLIES_STATE))?.replies.find(
+      row => row.conversationId === chat
+    )).toMatchObject({ replyId: bFinal, turnId: bTurn });
+    expect(sessionId).toBeTruthy();
+  });
+
+  it.each([
+    ['new-user-turn', '0221'],
+    ['unrelated-final', '0222'],
+    ['unrelated-native-image', '0223'],
+    ['no-new-output', '0224']
+  ])('keeps B pickup fail-closed when %s follows a late retired A final', async (scenario, suffix) => {
+    await pair();
+    const chat = 'cafe' + suffix + '-0000-4000-8000-000000000' + suffix.slice(1);
+    const aTurn = 'retired-A-' + suffix;
+    const bTurn = 'eligible-B-' + suffix;
+    const bFinal = 'eligible-B-final-' + suffix;
+    await saveConfig({
+      ...suiteConfig,
+      sessions: { ...suiteConfig.sessions, record: true },
+      goal: { ...suiteConfig.goal, backend: 'templates', enabled: false }
+    });
+    await request('POST', '/events', { body: { conversationId: chat, events: [
+      { kind: 'user_message', time: Date.now(), messageId: 'A-user-' + suffix, text: 'Do A' }
+    ] } });
+    await request('POST', '/goal/objective', { body: { conversationId: chat, text: 'Do A', mode: 'goal' } });
+    await request('POST', '/events', { body: { conversationId: chat, events: [
+      { kind: 'turn_start', time: Date.now(), turnId: aTurn }
+    ] } });
+    await request('POST', '/goal/objective', { body: { conversationId: chat, text: 'Do B', mode: 'goal' } });
+    await request('POST', '/events', { body: { conversationId: chat, events: [
+      { kind: 'user_message', time: Date.now(), messageId: 'B-user-' + suffix, text: 'Do B' },
+      { kind: 'turn_start', time: Date.now(), turnId: bTurn },
+      { kind: 'turn_end', time: Date.now(), turnId: bTurn, outcome: 'completed' },
+      { kind: 'assistant_message', time: Date.now(), messageId: bFinal, turnId: bTurn,
+        text: 'B continues.\n[[COS_GOAL:CONTINUE]]', state: 'final', final: true, goalEligible: true, activeNow: true }
+    ] } });
+    await request('POST', '/events', { body: { conversationId: chat, events: [
+      { kind: 'turn_end', time: Date.now(), turnId: aTurn, outcome: 'completed' },
+      { kind: 'assistant_message', time: Date.now(), messageId: 'A-late-' + suffix, turnId: aTurn,
+        text: 'A completes.\n[[COS_GOAL:COMPLETE]]', state: 'final', final: true, goalEligible: true, activeNow: false }
+    ] } });
+    expect(goalPendingReplyFor(chat)).toMatchObject({ replyId: bFinal, turnId: bTurn });
+    if (scenario === 'unrelated-native-image') {
+      const session = await findSessionByConversation(chat, { requireUnique: true });
+      expect(session).not.toBeNull();
+      await sessionStoreModule.appendEvent(session!.id, {
+        kind: 'native_image', source: 'extension', time: Date.now(), turnId: 'unrelated-image-turn-' + suffix,
+        messageId: 'unrelated-image-' + suffix, providerAssetId: 'file_1234567890abcdef',
+        providerRole: 'tool', providerChannel: 'final', providerStatus: 'finished_successfully', previewStatus: 'pending'
+      });
+    }
+    if (scenario !== 'unrelated-native-image' && scenario !== 'no-new-output')
+      await request('POST', '/events', { body: { conversationId: chat, events: scenario === 'new-user-turn'
+      ? [
+        { kind: 'user_message', time: Date.now(), messageId: 'C-user-' + suffix, text: 'Now C' },
+        { kind: 'turn_start', time: Date.now(), turnId: 'C-active-' + suffix }
+      ]
+      : [{
+        kind: 'assistant_message', time: Date.now(), messageId: 'unrelated-final-' + suffix, turnId: 'unrelated-turn-' + suffix,
+        text: 'A different response.', state: 'final', final: true, goalEligible: false, activeNow: false
+      }]
+    } });
+    expect(goalPendingReplyFor(chat)).toMatchObject({ replyId: bFinal, turnId: bTurn });
+    const denied = await request('POST', '/goal/draft', {
+      body: { conversationId: chat, turnId: bTurn, clientId: 'late-B-guard-' + suffix }
+    });
+    expect(denied.status, JSON.stringify(denied.body)).toBe(scenario === 'no-new-output' ? 200 : 409);
+    expect(goalPendingReplyFor(chat)).toMatchObject({ replyId: bFinal, turnId: bTurn });
+  });
+
+  it('retains a prior reply tombstone while fencing a different old active turn', async () => {
+    await pair();
+    const chat = 'cafe0206-0000-4000-8000-000000000206';
+    await saveConfig({
+      ...suiteConfig,
+      sessions: { ...suiteConfig.sessions, record: true },
+      goal: { ...suiteConfig.goal, backend: 'templates', enabled: false }
+    });
+    await request('POST', '/events', { body: { conversationId: chat, events: [
+      { kind: 'user_message', time: Date.now(), messageId: 'handover-prior-user', text: 'Complete objective A' }
+    ] } });
+    await request('POST', '/goal/objective', { body: { conversationId: chat, text: 'Complete objective A', mode: 'goal' } });
+    await request('POST', '/events', { body: { conversationId: chat, events: [
+      { kind: 'turn_start', time: Date.now(), turnId: 'handover-prior-turn' },
+      { kind: 'turn_end', time: Date.now(), turnId: 'handover-prior-turn', outcome: 'completed' },
+      { kind: 'assistant_message', time: Date.now(), messageId: 'handover-prior-final',
+        turnId: 'handover-prior-turn', text: 'Proceed.\n[[COS_GOAL:CONTINUE]]',
+        state: 'final', final: true, goalEligible: true, activeNow: true }
+    ] } });
+    expect(goalPendingReplyFor(chat)).toMatchObject({ replyId: 'handover-prior-final' });
+    await request('POST', '/events', { body: { conversationId: chat, events: [
+      { kind: 'user_message', time: Date.now(), messageId: 'handover-active-user', text: 'Continue objective A' },
+      { kind: 'turn_start', time: Date.now(), turnId: 'handover-active-turn' }
+    ] } });
+    await request('POST', '/goal/objective', { body: { conversationId: chat, text: 'Inspect objective B instead', mode: 'goal' } });
+    const snapshot = await readDurable<GoalRepliesSnapshot>(GOAL_REPLIES_STATE);
+    expect(snapshot).toMatchObject({ replies: expect.arrayContaining([
+      expect.objectContaining({ conversationId: chat, replyId: 'handover-prior-final',
+        staleObjective: true, staleTurnId: 'handover-active-turn', state: 'handled' })
+    ]) });
+    const { restoreGoalReplies } = await import('../src/main/goal.js');
+    restoreGoalReplies(snapshot);
+    await request('POST', '/events', { body: { conversationId: chat, events: [
+      { kind: 'turn_end', time: Date.now(), turnId: 'handover-active-turn', outcome: 'completed' },
+      { kind: 'assistant_message', time: Date.now(), messageId: 'handover-active-final',
+        turnId: 'handover-active-turn', text: 'A complete.\n[[COS_GOAL:COMPLETE]]',
+        state: 'final', final: true, goalEligible: true, activeNow: true }
+    ] } });
+    expect(goalPendingReplyFor(chat)).toBeNull();
+    await request('POST', '/events', { body: { conversationId: chat, events: [
+      { kind: 'user_message', time: Date.now(), messageId: 'handover-fresh-B-user', text: 'Inspect objective B instead' },
+      { kind: 'turn_start', time: Date.now(), turnId: 'handover-fresh-B-turn' },
+      { kind: 'turn_end', time: Date.now(), turnId: 'handover-fresh-B-turn', outcome: 'completed' },
+      { kind: 'assistant_message', time: Date.now(), messageId: 'handover-fresh-B-final',
+        turnId: 'handover-fresh-B-turn', text: 'B continues.\n[[COS_GOAL:CONTINUE]]',
+        state: 'final', final: true, goalEligible: true, activeNow: true }
+    ] } });
+    expect(goalPendingReplyFor(chat)).toMatchObject({ replyId: 'handover-fresh-B-final', turnId: 'handover-fresh-B-turn' });
+  });
+
+  it('preserves unchanged-objective Offline Goal pickup and accepts a genuinely new B turn', async () => {
+    await pair();
+    const chat = 'cafe0205-0000-4000-8000-000000000205';
+    await saveConfig({
+      ...suiteConfig,
+      sessions: { ...suiteConfig.sessions, record: true },
+      goal: { ...suiteConfig.goal, backend: 'templates', enabled: false }
+    });
+    await request('POST', '/events', { body: { conversationId: chat, events: [
+      { kind: 'user_message', time: Date.now(), messageId: 'handover-control-user-A', text: 'Finish objective A' }
+    ] } });
+    await request('POST', '/goal/objective', { body: { conversationId: chat, text: 'Finish objective A', mode: 'goal' } });
+    await request('POST', '/events', { body: { conversationId: chat, events: [
+      { kind: 'turn_start', time: Date.now(), turnId: 'handover-control-turn-A' }
+    ] } });
+    await request('POST', '/goal/objective', { body: { conversationId: chat, text: 'Finish objective A', mode: 'goal' } });
+    await request('POST', '/events', { body: { conversationId: chat, events: [
+      { kind: 'turn_end', time: Date.now(), turnId: 'handover-control-turn-A', outcome: 'completed' },
+      { kind: 'assistant_message', time: Date.now(), messageId: 'handover-control-final-A',
+        turnId: 'handover-control-turn-A',
+        text: 'More A work.\n[[COS_GOAL:CONTINUE]]', state: 'final', final: true, goalEligible: true, activeNow: true }
+    ] } });
+    expect(goalPendingReplyFor(chat)).toMatchObject({ replyId: 'handover-control-final-A' });
+    await request('POST', '/goal/objective', { body: { conversationId: chat, text: 'Inspect objective B instead', mode: 'goal' } });
+    expect(goalPendingReplyFor(chat)).toBeNull();
+    await request('POST', '/events', { body: { conversationId: chat, events: [
+      { kind: 'user_message', time: Date.now(), messageId: 'handover-control-user-B', text: 'Inspect objective B instead' },
+      { kind: 'turn_start', time: Date.now(), turnId: 'handover-control-turn-B' },
+      { kind: 'turn_end', time: Date.now(), turnId: 'handover-control-turn-B', outcome: 'completed' },
+      { kind: 'assistant_message', time: Date.now(), messageId: 'handover-control-final-B',
+        turnId: 'handover-control-turn-B',
+        text: 'Objective B done.\n[[COS_GOAL:COMPLETE]]', state: 'final', final: true, goalEligible: true, activeNow: true }
+    ] } });
+    expect(goalPendingReplyFor(chat)).toMatchObject({ replyId: 'handover-control-final-B' });
+    expect((await request('POST', '/goal/draft', {
+      body: { conversationId: chat, turnId: 'handover-control-turn-B', clientId: 'handover-control-client' }
+    })).status).toBe(200);
+    let feed = await request('GET', '/activity?conversationId=' + chat + '&goalClient=handover-control-client');
+    await vi.waitFor(async () => {
+      feed = await request('GET', '/activity?conversationId=' + chat + '&goalClient=handover-control-client');
+      expect(feed.body.goal.draft).toMatchObject({ stage: 'no-reply', turnId: 'handover-control-turn-B' });
+    });
+    expect(goalPendingReplyFor(chat)).toBeNull();
   });
 
   it('keeps new Offline Goal turns live after stale completion is retired', async () => {

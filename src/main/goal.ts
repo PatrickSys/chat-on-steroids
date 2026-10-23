@@ -417,6 +417,8 @@ function notifyGoalChange(): void { for (const listener of goalListeners) listen
 interface GoalReplyObligation {
   /** Its final predates a changed Offline Goal objective. Keep the replay tombstone. */
   staleObjective?: true;
+  /** A generation still running when this Offline objective was replaced. */
+  staleTurnId?: string;
   /** Only the deliberate user activation setter may grant this exemption. */
   explicitActivation?: true;
   /** Exact source turn captured before its silence grant retired. Pro also requires opt-in. */
@@ -524,6 +526,8 @@ export function restoreGoalReplies(snapshot: GoalRepliesSnapshot | null): void {
           ? { pickupStoppedAt: raw.acceptedAt } : {}),
       ...(raw.explicitActivation === true ? { explicitActivation: true } : {}),
       ...(raw.staleObjective === true ? { staleObjective: true } : {}),
+      ...(typeof raw.staleTurnId === 'string' && raw.staleTurnId.length <= 200 && raw.staleTurnId
+        ? { staleTurnId: raw.staleTurnId } : {}),
       eventSeq: raw.eventSeq,
       acceptedAt: raw.acceptedAt,
       state: raw.state
@@ -579,6 +583,13 @@ export function goalPendingReplyFor(
       ...(reply.pickupNextAt ? { pickupNextAt: reply.pickupNextAt } : {}),
       ...(reply.pickupStoppedAt ? { pickupStoppedAt: reply.pickupStoppedAt } : {}) }
     : null;
+}
+
+/** Internal Goal owner: one still-pending B turn and its durably retired A source. */
+export function retiredGoalSourceFor(conversationId: string, sessionId: string, turnId: string): string | null {
+  const reply = goalReplies.get(conversationId);
+  return reply?.state === 'pending' && reply.sessionId === sessionId && reply.turnId === turnId &&
+    Date.now() - reply.acceptedAt < GOAL_REPLY_TTL_MS ? reply.staleTurnId ?? null : null;
 }
 
 /**
@@ -677,6 +688,20 @@ export async function acceptGoalReplyNow(input: {
   if (!input.handledOnly && await astraFinishOnly(input.sessionId, input.conversationId)) return;
   if (input.silenceSourceTurnId &&
       !await turnHasMcpCall(input.sessionId, input.conversationId, input.silenceSourceTurnId)) return;
+  // Preserve the duplicate fast path; repeat only the owner check after async policy reads.
+  const initial = goalReplies.get(input.conversationId);
+  if (initial?.replyId === input.replyId || (initial && initial.eventSeq > input.eventSeq)) return;
+  const eligible =
+    !input.handledOnly && !input.blocked &&
+    getConfig().sessions.record &&
+    goalArmedFor(input.conversationId) &&
+    await goalKeyPresent(goalSwitchFor(input.conversationId).mode) &&
+    (goalSwitchFor(input.conversationId).mode !== 'loop' ||
+      await automaticLoopHasMcpWork(input.sessionId, input.conversationId, input.silenceSourceTurnId ?? input.turnId));
+  if (input.current && !input.current()) return;
+  // Inspect the reply owner AFTER asynchronous policy checks: an objective save may
+  // have durably fenced this exact in-flight turn while those checks were waiting.
+  const bounded = snapshotGoalReplies().replies;
   const current = goalReplies.get(input.conversationId);
   if (current?.replyId === input.replyId || (current && current.eventSeq > input.eventSeq)) return;
   const provisionalUpgrade = Boolean(
@@ -685,21 +710,20 @@ export async function acceptGoalReplyNow(input: {
       current.turnId === input.turnId &&
       current.replyId === `turn:${input.turnId}`.slice(0, 200)
   );
+  // A genuine B reply carries the retired A turn's identity forward. A late
+  // observation of A may have a higher sequence, but must not replace B's debt.
+  const staleSource = (current?.staleObjective === true && current.turnId === input.turnId) ||
+    current?.staleTurnId === input.turnId;
+  if (staleSource) return;
+  const staleTurnId = current?.staleTurnId ?? (current?.staleObjective ? current.turnId : undefined);
   const before = current ? { ...current } : null;
-  const bounded = snapshotGoalReplies().replies;
-  const active =
-    !input.handledOnly && !input.blocked &&
-    getConfig().sessions.record &&
-    goalArmedFor(input.conversationId) &&
-    await goalKeyPresent(goalSwitchFor(input.conversationId).mode) &&
-    (goalSwitchFor(input.conversationId).mode !== 'loop' ||
-      await automaticLoopHasMcpWork(input.sessionId, input.conversationId, input.silenceSourceTurnId ?? input.turnId));
-  if (input.current && !input.current()) return;
+  const active = eligible && goalArmedFor(input.conversationId);
   goalReplies.set(input.conversationId, {
     conversationId: input.conversationId,
     sessionId: input.sessionId,
     replyId: input.replyId.slice(0, 200),
     turnId: input.turnId.slice(0, 200),
+    ...(staleTurnId ? { staleTurnId } : {}),
     ...(provisionalUpgrade && current?.staleObjective ? { staleObjective: true } : {}),
     ...(input.silenceSourceTurnId ? { silenceSourceTurnId: input.silenceSourceTurnId.slice(0, 200) } : {}),
     ...(input.silencePro ? { silencePro: true } : {}),
@@ -1490,9 +1514,21 @@ export async function setGoalReplyActiveNow(conversationId: string, active: bool
   return true;
 }
 
-export async function retireGoalReplyForObjectiveNow(conversationId: string): Promise<void> {
+export async function retireGoalReplyForObjectiveNow(conversationId: string,
+  inFlight?: { sessionId: string; turnId: string }): Promise<void> {
   const reply = goalReplies.get(conversationId);
-  if (reply) reply.staleObjective = true;
+  if (reply) {
+    reply.staleObjective = true;
+    if (inFlight && reply.turnId !== inFlight.turnId) reply.staleTurnId = inFlight.turnId.slice(0, 200);
+  } else if (inFlight) {
+    // This is the existing reply ledger's handled provisional turn, not a second
+    // objective/epoch owner. A stable final later upgrades the same tombstone.
+    goalReplies.set(conversationId, {
+      conversationId, sessionId: inFlight.sessionId,
+      replyId: `turn:${inFlight.turnId}`.slice(0, 200), turnId: inFlight.turnId.slice(0, 200),
+      eventSeq: 0, acceptedAt: Date.now(), state: 'handled', staleObjective: true
+    });
+  }
   await setGoalReplyActiveNow(conversationId, false);
 }
 

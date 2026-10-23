@@ -95,6 +95,7 @@ import {
   GOAL_HOLD_TOOLS,
   goalObjectiveFor,
   goalPendingReplyFor,
+  retiredGoalSourceFor,
   goalReplySourceTurn,
   consumeGoalReplyForInputNow,
   goalSwitchFor,
@@ -2200,6 +2201,14 @@ async function saveConversationObjective(id: string, text: string, named: 'goal'
   if (goalWorkerChat(id)) throw new Error('goal_worker_chat');
   if (text.trim() && await conversationWasSuperseded(id)) throw new Error('conversation_superseded');
   if (text.trim() && isChatBlocked(id)) throw new Error('chat_blocked');
+  // Capture an old turn only for a possible Offline Goal handover, before an
+  // awaited switch save can move it. Loop/API objective edits need no lookup.
+  const offlineHandover = goalBackendFor('goal') === 'templates' && goalObjectiveFor(id) !== text.trim() &&
+    (named === 'goal' || (goalModeFor(id) === 'goal' && (named === null || !text.trim())));
+  const source = offlineHandover ? await findSessionByConversation(id, { requireUnique: true }) : null;
+  // No recorded session is valid for a new objective; multiple current owners
+  // cannot safely identify the turn to retire. Refuse before either ledger changes.
+  if (offlineHandover && !source && await findSessionByConversation(id)) throw new Error('goal_source_ambiguous');
   let chatSwitch: { enabled: boolean; mode: 'goal' | 'loop' } | null = null;
   if (named) {
     const held = goalSwitchFor(id);
@@ -2211,7 +2220,8 @@ async function saveConversationObjective(id: string, text: string, named: 'goal'
   }
   await assertCurrent();
   if (goalModeFor(id) === 'goal' && goalBackendFor('goal') === 'templates' && goalObjectiveFor(id) !== text.trim()) {
-    await retireGoalReplyForObjectiveNow(id);
+    await retireGoalReplyForObjectiveNow(id,
+      source?.activeTurnId ? { sessionId: source.id, turnId: source.activeTurnId } : undefined);
     await assertCurrent();
   }
   const objective = await setGoalObjectiveNow(id, text);
@@ -7310,6 +7320,49 @@ async function goalWaitFor(conversationId: string, sessionId: string, now = Date
   return { reason: 'settling' };
 }
 
+/**
+ * The native transcript may deliver a retired A final after B's accepted Goal
+ * final. Generic completion rightly treats any newer answer as fresh work.
+ * For this one Offline handover, B can still be collected only if the bounded
+ * durable tail proves ALL newer work belongs to the exact retired A turn.
+ * Unknown history, another question, tool work and active generation fail closed.
+ */
+async function completedGoalBeforeRetiredFinal(conversationId: string, turnId: string, sessionId: string): Promise<boolean> {
+  if (goalModeFor(conversationId) !== 'goal' || goalBackendFor('goal') !== 'templates') return false;
+  const pending = goalPendingReplyFor(conversationId);
+  if (!pending || pending.turnId !== turnId) return false;
+  const retired = retiredGoalSourceFor(conversationId, sessionId, turnId);
+  if (!retired) return false;
+  const before = await getSession(sessionId);
+  if (!before || before.conversationId !== conversationId || before.activeTurnId) return false;
+  const questionId = before.timelineTurns?.[turnId]?.questionId;
+  const sourceOrigin = before.timelineTurns?.[retired]?.origin;
+  const currentOrigin = before.timelineTurns?.[turnId]?.origin;
+  if (!questionId || typeof sourceOrigin !== 'number' || typeof currentOrigin !== 'number' ||
+      sourceOrigin >= currentOrigin) return false;
+  const tail = await readRecentEvents(sessionId, 256, {
+    kinds: ['user_message', 'turn_start', 'turn_end', 'assistant_message', 'native_image', 'tool_call', 'page_tool']
+  });
+  if (tail.length >= 256) return false;
+  const ordered = [...tail].sort((a, b) => a.seq - b.seq);
+  const lastQuestion = ordered.findLast(event => event.kind === 'user_message');
+  if (lastQuestion?.kind !== 'user_message' || lastQuestion.messageId !== questionId) return false;
+  const bFinal = ordered.findLast(event => event.kind === 'assistant_message' &&
+    event.turnId === turnId && event.final === true && !!event.messageId);
+  if (!bFinal) return false;
+  const later = ordered.filter(event => event.seq > bFinal.seq);
+  // Conservatively refuse every newer image, including images attributed to A.
+  if (!later.length || !later.every(event => (event.kind === 'turn_end' ||
+    event.kind === 'assistant_message') && event.turnId === retired)) return false;
+  const after = await getSession(sessionId);
+  const current = goalPendingReplyFor(conversationId);
+  return !!after && after.conversationId === conversationId && !after.activeTurnId &&
+    after.events === before.events && current?.replyId === pending.replyId &&
+    current.acceptedAt === pending.acceptedAt &&
+    retiredGoalSourceFor(conversationId, sessionId, turnId) === retired &&
+    runningToolCalls(conversationId) === 0 && !chatIsWorking(conversationId);
+}
+
 async function chatStillWorking(conversationId: string, turnId: string, sessionId: string, now = Date.now()): Promise<boolean> {
   if (runningToolCalls(conversationId) > 0) return true;
   const workGrant = activeUntil.get(conversationId);
@@ -7330,7 +7383,8 @@ async function chatStillWorking(conversationId: string, turnId: string, sessionI
   }
   if (pro && turnId.startsWith('g-silence-') && !loopAfterTurnFor(conversationId)) return true;
   if (turnId.startsWith('g-silence-') && await silenceContinuationAllowed(conversationId, sessionId)) return false;
-  if (!await readCompletedFinal(sessionId, conversationId, turnId)) return true;
+  if (!await readCompletedFinal(sessionId, conversationId, turnId) &&
+      !await completedGoalBeforeRetiredFinal(conversationId, turnId, sessionId)) return true;
   // Evidence may have changed while the durable tail was read.
   return runningToolCalls(conversationId) > 0 || chatIsWorking(conversationId) ||
     lastAttributedCallAt.get(conversationId) !== last;

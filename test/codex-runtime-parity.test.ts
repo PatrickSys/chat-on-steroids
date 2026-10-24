@@ -1,3 +1,5 @@
+import { once } from 'node:events';
+import { createServer, Socket } from 'node:net';
 import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -384,6 +386,107 @@ describe('Codex unified exec runtime parity', () => {
     expect(polled.rawOutput.toString('utf8')).toContain('first-poll-output');
     expect(polled.wallTimeMs).toBeLessThan(2_500);
     expect(polled.processId).toBe(processId);
+  });
+
+  it('drains a live process through first output, terminal tail and completed replay without rerunning it', async () => {
+    const instance = manager();
+    managers.push(instance);
+    const processId = instance.allocateProcessId();
+    const server = createServer();
+    const peers = new Set<Socket>();
+    const handshakeErrors: Error[] = [];
+    let launches = 0;
+    server.on('connection', peer => {
+      launches += 1;
+      peers.add(peer);
+      peer.on('error', error => handshakeErrors.push(error));
+      peer.once('close', () => peers.delete(peer));
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(0, '127.0.0.1', resolve);
+      });
+      const address = server.address();
+      if (!address || typeof address === 'string') throw new Error('Missing handshake address');
+      const connected = once(server, 'connection', { signal: AbortSignal.timeout(5_000) });
+      void connected.catch(() => undefined);
+      const childScript = [
+        "const socket=require('node:net').createConnection({host:'127.0.0.1',port:" + address.port + "});",
+        "let input='',emitted=false,released=false;socket.setEncoding('utf8');",
+        "socket.on('data',chunk=>{input+=chunk;let end;while((end=input.indexOf('\\n'))!==-1){",
+        "const command=input.slice(0,end);input=input.slice(end+1);",
+        "if(command==='emit'&&!emitted){emitted=true;process.stdout.write('first:'+process.pid+'\\n');}",
+        "else if(command==='release'&&emitted){released=true;process.stdout.write('tail:'+process.pid+'\\n',()=>{socket.end();});}",
+        "}});socket.on('close',()=>process.exit(released?17:23));socket.on('error',()=>process.exit(23));"
+      ].join('');
+      const initial = await instance.execCommand({
+        command: [process.execPath, '-e', childScript],
+        shellType: process.platform === 'win32' ? 'powershell' : 'bash',
+        hookCommand: 'handshaken foreground drain parity child',
+        processId,
+        yieldTimeMs: 250,
+        maxOutputTokens: undefined,
+        truncationPolicy,
+        cwd: process.cwd(),
+        displayCwd: process.cwd(),
+        env: applyUnifiedExecEnv(process.env),
+        tty: false
+      });
+      expect(initial.processId).toBe(processId);
+      expect(initial.exitCode).toBeNull();
+      expect(initial.rawOutput.toString('utf8')).toBe('');
+      const [peer] = await connected;
+      if (!(peer instanceof Socket)) throw new Error('Missing child handshake socket');
+      const live = instance.listProcesses().find(item => item.processId === processId);
+      if (!live) throw new Error('Child not listed as live');
+      expect(live.pid).toBeGreaterThan(0);
+      const poll = { processId, input: '', yieldTimeMs: 5_000, maxOutputTokens: undefined, truncationPolicy };
+      peer.write('emit\n');
+      const first = await instance.writeStdin(poll);
+      const firstLine = 'first:' + live.pid + '\n';
+      const tailLine = 'tail:' + live.pid + '\n';
+      expect(first.rawOutput.toString('utf8')).toBe(firstLine);
+      expect(first.processId).toBe(processId);
+      expect(first.exitCode).toBeNull();
+      expect(first.completedSessionId).toBeUndefined();
+      expect(instance.listProcesses()).toContainEqual(expect.objectContaining({
+        processId, pid: live.pid, incarnation: live.incarnation
+      }));
+      // Only this explicit handshake releases the child to produce its tail and exit.
+      const pending = instance.writeStdin(poll);
+      peer.write('release\n');
+      let terminal = await pending;
+      const drained: Buffer[] = [terminal.rawOutput];
+      while (terminal.processId !== null) {
+        expect(terminal.processId).toBe(processId);
+        expect(terminal.exitCode).toBeNull();
+        terminal = await instance.writeStdin(poll);
+        drained.push(terminal.rawOutput);
+      }
+      expect(Buffer.concat(drained).toString('utf8')).toBe(tailLine);
+      expect(Buffer.concat([initial.rawOutput, first.rawOutput, ...drained]).toString('utf8')).toBe(firstLine + tailLine);
+      expect(terminal.completedSessionId).toBe(processId);
+      expect(terminal.exitCode).toBe(17);
+      expect(terminal.replayed).not.toBe(true);
+      expect(instance.listProcesses()).toEqual([]);
+      const replay = await instance.writeStdin(poll);
+      expect(replay).toMatchObject({ processId: null, completedSessionId: processId, exitCode: 17, replayed: true });
+      expect(replay.rawOutput.toString('utf8')).toBe(firstLine + tailLine);
+      expect(launches).toBe(1);
+      expect(handshakeErrors).toEqual([]);
+    } finally {
+      try {
+        await instance.terminateAllProcesses();
+      } finally {
+        for (const peer of peers) peer.destroy();
+        if (server.listening) await new Promise<void>((resolve, reject) => {
+          server.close(error => error ? reject(error) : resolve());
+        });
+        expect(server.listening).toBe(false);
+        expect(instance.listProcesses()).toEqual([]);
+      }
+    }
   });
 
   it.runIf(process.platform === 'win32')('forces UTF-8 for PowerShell pipe output like Codex', async () => {

@@ -128,6 +128,7 @@ function coreInstructions(ctx: ToolContext, platform: NodeJS.Platform, skills: s
       'Batch checks with exec_command cmds: [...]: one shell, per-command output and exit codes.',
       'Set workdir to the project; virtual paths work there. Inside cmd use relative or native paths.',
       "write_stdin takes session_id: a running command's id, or pass a finished command's completed_session_id as session_id. Completed reads replay output without rerunning work. Inspect exit/output; expected_exit marks an expected non-zero result.",
+      'A running session_id is intermediate output. Empty write_stdin can return on the first output before exit. For foreground work, drain the same session_id until terminal exit; never rerun the original command to recover output. Respect explicit Stop and deadlines; intentionally long-lived background services can remain running.',
       'If output is truncated, narrow the command or read the relevant region.'
     );
     if (windows) lines.push(

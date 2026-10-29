@@ -935,13 +935,38 @@ var CLF_DOM = (() => {
    * its buttons and key hints, and whether ChatGPT lets Allow once be pressed. In a chat with
    * external app access switched off, ChatGPT shows the card with Allow once disabled and only
    * Deny enabled (2026-10-14), so the app must not offer Allow there. Only text leaves the page.
+   *
+   * Also says where the shared-data rows start (`data`: the <dl> of argument names and values, which the
+   * model and whatever it read wrote, not ChatGPT), whether words of the card's own were left out (`cut`:
+   * more than eight lines, a line over 300 characters, more than eight dropped texts or one over 100) and the
+   * texts dropped from the reading (`extra`: any button other than Deny, Allow once and the options menu,
+   * icons, hidden parts, labels and image descriptions outside the shared data, where a warning drawn as a
+   * fold-out or an icon caption would otherwise vanish). The app judges the card on the lines before `data`
+   * and on `extra`, and a request has none.
    */
   function approvalCard() {
     return safe(() => {
       const node = waitingApprovalCard();
       if (!node) return null;
       const clone = node.cloneNode(true);
-      for (const drop of clone.querySelectorAll('button, kbd, svg, script, style, [aria-hidden="true"]')) drop.remove();
+      for (const drop of clone.querySelectorAll('kbd')) drop.remove();
+      let dataFrom = -1, mixed = false, cut = false;
+      const extra = [];
+      const keep = text => {
+        const line = (text || '').replace(/\s+/g, ' ').trim();
+        if (!line || extra.includes(line)) return;
+        if (line.length > 100 || extra.length >= 8) { cut = true; return; }
+        extra.push(line);
+      };
+      // Read on the card itself: the buttons every request has (Deny, Allow once, the options menu) and what is
+      // inside them are not reported; neither is anything inside the shared data, which the model wrote.
+      const known = [approvalButton(node, 'deny', true), approvalButton(node, 'allow', true), ...node.querySelectorAll('button[aria-haspopup="menu"]')].filter(Boolean);
+      for (const part of node.querySelectorAll('button, svg, [aria-hidden="true"], [aria-label], [title], img[alt]')) {
+        if (known.some(button => button.contains(part)) || part.closest('dt, dd')) continue;
+        if (part.matches('button, svg, [aria-hidden="true"]')) keep(part.textContent);
+        keep(part.getAttribute('aria-label')); keep(part.getAttribute('title')); keep(part.getAttribute('alt'));
+      }
+      for (const drop of clone.querySelectorAll('button, svg, script, style, [aria-hidden="true"]')) drop.remove();
       const lines = [];
       // The shared data is a <dl> (2026-10-25): a label and its value share one grid row, so each
       // term and definition is a block of its own, and a value follows its label as "label: value".
@@ -960,43 +985,67 @@ var CLF_DOM = (() => {
         wrapper.set(owner, part);
         groups.set(owner, (groups.get(owner) || '') + gap + node.textContent);
       }
-      const push = line => { if (line && lines.at(-1) !== line && lines.length < 8) lines.push(line); };
+      let lastData = false;
+      const push = (line, isData) => {
+        // A repeated line is dropped only when both are the same kind: a data value equal to a heading is not that heading.
+        if (!line || (lines.at(-1) === line && lastData === Boolean(isData))) return;
+        if (lines.length >= 8) { if (!isData) cut = true; return; }
+        // A line of the card's own after a data row leaves no clean split: every line then counts as the card's own.
+        if (isData) { if (dataFrom < 0) dataFrom = lines.length; } else if (dataFrom >= 0) mixed = true;
+        lines.push(line);
+        lastData = Boolean(isData);
+      };
       // A label waits for the value of its own row; a second label, another row or any other block
       // shows it alone. A pair longer than a line keeps label and value on lines of their own.
       let term = null;
       for (const [owner, text] of groups) {
-        const line = text.replace(/\s+/g, ' ').trim().slice(0, 300);
+        const full = text.replace(/\s+/g, ' ').trim();
+        // Cut on whole characters and trimmed after the cut, so the app reads the very same line back.
+        const line = (/[\uD800-\uDBFF]$/.test(full.slice(0, 300)) ? full.slice(0, 299) : full.slice(0, 300)).trim();
         if (!line) continue;
+        if (full.length > 300 && owner.tagName !== 'DT' && owner.tagName !== 'DD') cut = true;
         const pairs = owner.tagName === 'DD' && term && term.row === owner.parentElement;
-        if (term && !pairs) push(term.line);
+        if (term && !pairs) push(term.line, true);
         if (owner.tagName === 'DT') { term = { line, row: owner.parentElement }; continue; }
-        if (pairs && term.line.length + 2 + line.length <= 300) push(`${term.line}: ${line}`);
-        else { if (pairs) push(term.line); push(line); }
+        if (pairs && term.line.length + 2 + line.length <= 300) push(`${term.line}: ${line}`, true);
+        else { if (pairs) push(term.line, true); push(line, owner.tagName === 'DD'); }
         term = null;
       }
-      if (term) push(term.line);
-      return { node, lines, allow: approvalButton(node, 'allow') !== null };
+      if (term) push(term.line, true);
+      return { node, lines, allow: approvalButton(node, 'allow') !== null, cut, extra, data: dataFrom < 0 || mixed ? lines.length : dataFrom };
     }, null);
   }
 
   /** Deny carries an Esc key hint and Allow once a Return hint (2026-10-14); no label is read. */
-  function approvalButton(card, choice) {
+  function approvalButton(card, choice, anyState) {
     const hint = choice === 'deny' ? 'Esc' : choice === 'allow' ? '\u23CE' : null;
     if (!hint) return null;
     const buttons = [...card.querySelectorAll('button')].filter(button =>
       [...button.querySelectorAll('kbd')].some(kbd => kbd.textContent.trim() === hint));
     const button = buttons.length === 1 ? buttons[0] : null;
-    return button && !button.disabled && button.getAttribute('aria-disabled') !== 'true' ? button : null;
+    return button && (anyState || (!button.disabled && button.getAttribute('aria-disabled') !== 'true')) ? button : null;
   }
 
   /**
    * Presses Deny or Allow once on exactly the card the person answered in the app. A card that is
    * gone or replaced is never answered through an old reference, and the options menu beside
    * Allow once (where "always" lives) is never touched.
+   *
+   * `expected` is the card as the answer was given for it (2026-10-29): `{ lines, data, cut, extra }`. It is
+   * read from the page again right here, immediately before the press, and a card that differs in any line,
+   * in where the data starts, in what was cut or in a dropped text, or that cannot be read, is not pressed:
+   * ChatGPT may reuse the same element for a different request between the app's decision and this press.
+   * Without `expected` (an app from before) only the element counts.
    */
-  function answerApprovalCard(card, choice) {
+  function answerApprovalCard(card, choice, expected) {
     return safe(() => {
       if (!card || !card.isConnected || waitingApprovalCard() !== card) return 'card_changed';
+      if (expected !== undefined) {
+        const now = approvalCard();
+        const same = (a, b) => Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((line, index) => line === b[index]);
+        if (!expected || typeof expected !== 'object' || !now || now.node !== card || !same(now.lines, expected.lines) ||
+          !same(now.extra, expected.extra) || now.data !== expected.data || now.cut !== (expected.cut === true)) return 'card_changed';
+      }
       const button = approvalButton(card, choice);
       if (!button) return 'unavailable';
       button.click();

@@ -2,8 +2,8 @@ import { readFileSync } from 'node:fs';
 import { JSDOM } from 'jsdom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  APPROVAL_ANSWER_MS, APPROVAL_FRESH_MS, AUTO_ANSWERS_PER_EPISODE, AUTO_PAUSE_AFTER_DENY_MS, APPROVAL_GONE_MS, APPROVAL_NOTICE_GRACE_MS, approvalAnswerFor, approvalCardView, approvalCardWaiting, approvalWaitingChats, cardNamedConnector, noteApprovalCard,
-  requestApprovalAnswer, resetApprovalWaits, settleApprovalAnswer, type ApprovalWaitDeps
+  APPROVAL_ANSWER_MS, APPROVAL_FRESH_MS, AUTO_ANSWERS_PER_EPISODE, AUTO_PAUSE_AFTER_DENY_MS, APPROVAL_GONE_MS, APPROVAL_NOTICE_GRACE_MS, approvalAnswerFor, approvalCardView, approvalCardWaiting, approvalWaitingChats, cardNamedConnector, noteApprovalCard, parseApprovalCard,
+  requestApprovalAnswer, resetApprovalWaits, settleApprovalAnswer, type ApprovalCardFacts, type ApprovalWaitDeps
 } from '../src/main/approval-wait.js';
 import { APPROVAL_ANSWERED_TEXT, APPROVAL_WAITING_TEXT } from '../src/shared/approval-wait.js';
 
@@ -188,7 +188,7 @@ describe('answering the card from the app', () => {
     const asked = requestApprovalAnswer('chat', 'c1', 'deny', 1_100);
     expect(asked).toMatchObject({ ok: true });
     const token = asked.ok ? asked.token : '';
-    expect(approvalAnswerFor('chat', 1_200)).toEqual({ token, cardId: 'c1', choice: 'deny' });
+    expect(approvalAnswerFor('chat', 1_200)).toEqual({ token, cardId: 'c1', choice: 'deny', words: { lines: expect.any(Array), data: null, cut: false, extra: [] } });
     // A second click while the first is on its way changes nothing.
     expect(requestApprovalAnswer('chat', 'c1', 'allow', 1_300)).toEqual({ ok: false, error: 'answer_pending' });
     expect(settleApprovalAnswer('chat', 'not-the-token', 'clicked')).toBe(false);
@@ -223,7 +223,9 @@ describe('answering the card from the app', () => {
 describe('the page detector', () => {
   const source = readFileSync(new URL('../extension/chatgpt-dom.js', import.meta.url), 'utf8');
   let dom: JSDOM;
-  let api: { approvalWaiting(): boolean; approvalCard(): null | { node: Element; lines: string[]; allow: boolean }; answerApprovalCard(node: Element, choice: string): string };
+  let api: { approvalWaiting(): boolean; approvalCard(): null | { node: Element; lines: string[]; allow: boolean; cut: boolean; data: number; extra: string[] }; answerApprovalCard(node: Element, choice: string, expected?: unknown): string };
+  type Found = NonNullable<ReturnType<typeof api.approvalCard>>;
+  const wordsOf = (found: Found & { extra?: string[] }) => ({ lines: [...found.lines], data: found.data, cut: found.cut, extra: [...(found.extra ?? [])] });
   beforeEach(() => {
     dom = new JSDOM('<main></main>', { url: 'https://chatgpt.com/c/chat', runScripts: 'outside-only', pretendToBeVisual: true });
     Object.defineProperty(dom.window.HTMLElement.prototype, 'getClientRects', {
@@ -308,6 +310,142 @@ describe('the page detector', () => {
     expect(api.answerApprovalCard(old, 'deny')).toBe('card_changed');
   });
 
+  // 2026-10-29: the app's decision was made on the words of one poll; ChatGPT may reuse the same element for another
+  // request before the press. The words are read again right where the button is pressed.
+  it('presses only while the card still says what the answer was given for, read again just before the press', () => {
+    const main = dom.window.document.querySelector('main')!;
+    main.innerHTML = liveCard();
+    const clicks: string[] = [];
+    for (const button of main.querySelectorAll('button')) button.addEventListener('click', () => clicks.push(button.textContent!.replace(/\s+/g, ' ').trim()));
+    const found = api.approvalCard()!;
+    const said = wordsOf(found);
+    const title = [...main.querySelectorAll('div')].find(div => div.textContent === 'ChatGPT erlauben, Gmail zu verwenden?')!;
+    // The element is reused for a safety card between the decision and the press: nothing is pressed.
+    title.textContent = 'Verdächtige Anweisung';
+    expect(api.answerApprovalCard(found.node, 'allow', said)).toBe('card_changed');
+    expect(api.answerApprovalCard(found.node, 'deny', said)).toBe('card_changed');
+    expect(clicks).toEqual([]);
+    // One later line reworded, one line added: the same.
+    title.textContent = 'ChatGPT erlauben, Gmail zu verwenden?';
+    const detail = [...main.querySelectorAll('div')].find(div => div.firstChild?.textContent === 'Erstellt einen Entwurf. ')!;
+    detail.firstChild!.textContent = 'Löscht alle Entwürfe. ';
+    expect(api.answerApprovalCard(found.node, 'allow', said)).toBe('card_changed');
+    detail.firstChild!.textContent = 'Erstellt einen Entwurf. ';
+    const extra = dom.window.document.createElement('p');
+    extra.textContent = 'Zusätzliche Zeile';
+    main.querySelector('[role="alert"]')!.append(extra);
+    expect(api.answerApprovalCard(found.node, 'allow', said)).toBe('card_changed');
+    extra.remove();
+    expect(clicks).toEqual([]);
+    // Words that cannot be compared are not a match: missing lines, a string, null, other lines.
+    for (const expected of [[], 'ChatGPT erlauben, Gmail zu verwenden?', null, { ...said, lines: ['Gmail'] }, { ...said, lines: [...said.lines, 'x'] }, { ...said, lines: [1, 2, 3] }, { ...said, lines: undefined },
+      { ...said, data: said.data - 1 }, { ...said, data: undefined }, { ...said, cut: true }, { ...said, extra: [...said.extra, 'Warning'] }, { ...said, extra: undefined }, 42]) {
+      expect(api.answerApprovalCard(found.node, 'allow', expected), JSON.stringify(expected)).toBe('card_changed');
+    }
+    expect(clicks).toEqual([]);
+    // The same words: pressed. An answer without words (an app from before) is judged by the element alone, as it was.
+    expect(api.answerApprovalCard(found.node, 'allow', said)).toBe('clicked');
+    expect(api.answerApprovalCard(found.node, 'deny')).toBe('clicked');
+    expect(clicks).toEqual(['Einmal zulassen⏎', 'AblehnenEsc']);
+  });
+
+  it('does not press when the words cannot be read at the moment of the press', () => {
+    const main = dom.window.document.querySelector('main')!;
+    main.innerHTML = liveCard();
+    const found = api.approvalCard()!;
+    // The card goes away and an identical one is drawn in a new element: the old reference is not pressed either.
+    main.innerHTML = liveCard();
+    expect(api.answerApprovalCard(found.node, 'allow', wordsOf(found))).toBe('card_changed');
+    expect(api.answerApprovalCard(null as unknown as Element, 'allow', wordsOf(found))).toBe('card_changed');
+  });
+
+  it('says where the shared data starts and whether the card\'s own words were cut, so the app can judge the words only ChatGPT wrote', () => {
+    const main = dom.window.document.querySelector('main')!;
+    const wrap = (inner: string) => `<div data-codex-approval-surface="true"><div role="alert">${inner}</div><button>Ablehnen<kbd>Esc</kbd></button><button>Einmal zulassen<kbd>⏎</kbd></button></div>`;
+    main.innerHTML = wrap('<div>ChatGPT erlauben, Chat On Steroids Core zu verwenden?</div><div>Zu den geteilten Daten gehören:</div><dl><div><dt>Befehl</dt><dd>rg "Suspicious"</dd></div><div><dt>Ordner</dt><dd>C:/demo</dd></div></dl>');
+    expect(api.approvalCard()).toMatchObject({
+      lines: ['ChatGPT erlauben, Chat On Steroids Core zu verwenden?', 'Zu den geteilten Daten gehören:', 'Befehl: rg "Suspicious"', 'Ordner: C:/demo'], data: 2, cut: false, extra: []
+    });
+    // A data value equal to a heading is not that heading: a repeat is dropped only between lines of one kind.
+    main.innerHTML = wrap('<div>Title?</div><dl><div><dd>Suspicious Instruction</dd></div></dl><h3>Suspicious Instruction</h3>');
+    expect(api.approvalCard()).toMatchObject({ lines: ['Title?', 'Suspicious Instruction', 'Suspicious Instruction'], data: 3, cut: false });
+    // No shared data: every line is the card's own.
+    main.innerHTML = wrap('<div>Allow ChatGPT to use Chat On Steroids Core?</div><div>Runs a command.</div>');
+    expect(api.approvalCard()).toMatchObject({ lines: ['Allow ChatGPT to use Chat On Steroids Core?', 'Runs a command.'], data: 2, cut: false });
+    // A line of the card's own after the data leaves no clean split: all of it counts as the card's own.
+    main.innerHTML = wrap('<div>Title?</div><dl><div><dt>Befehl</dt><dd>ls</dd></div></dl><div>Suspicious Instruction</div>');
+    expect(api.approvalCard()).toMatchObject({ lines: ['Title?', 'Befehl: ls', 'Suspicious Instruction'], data: 3, cut: false });
+    // More than eight lines of the card's own: words were left out. Shared data past the eighth line is not "words left out".
+    main.innerHTML = wrap(Array.from({ length: 10 }, (_, index) => `<div>Line ${index + 1}</div>`).join(''));
+    expect(api.approvalCard()).toMatchObject({ data: 8, cut: true });
+    expect(api.approvalCard()!.lines).toHaveLength(8);
+    main.innerHTML = wrap('<div>Title?</div><dl>' + Array.from({ length: 12 }, (_, index) => `<div><dt>K${index}</dt><dd>v${index}</dd></div>`).join('') + '</dl>');
+    expect(api.approvalCard()).toMatchObject({ data: 1, cut: false });
+    expect(api.approvalCard()!.lines).toHaveLength(8);
+  });
+
+  // A warning drawn as a fold-out button, an icon caption, a hidden part or a label is dropped from the card's lines
+  // (the buttons and icons are not its words), so the page reports the dropped texts for the app to read too.
+  it('reads the texts it drops, so a warning drawn as a button, an icon caption, a hidden part or a label is still seen', () => {
+    const main = dom.window.document.querySelector('main')!;
+    const wrap = (inner: string, outside = '') => `<div data-codex-approval-surface="true"><div role="alert">${inner}</div>${outside}<button>Ablehnen<kbd>Esc</kbd></button><button>Einmal zulassen<kbd>⏎</kbd></button></div>`;
+    const title = '<div>Allow ChatGPT to use Chat On Steroids Core?</div>';
+    main.innerHTML = wrap(title);
+    // Deny, Allow once and the options menu are on every request and are not reported.
+    expect(api.approvalCard()).toMatchObject({ lines: ['Allow ChatGPT to use Chat On Steroids Core?'], extra: [], cut: false });
+    main.innerHTML = wrap(title, '<button aria-haspopup="menu" aria-label="Approval options"></button>');
+    expect(api.approvalCard()).toMatchObject({ extra: [], cut: false });
+    const seen = (inner: string, outside = '') => { main.innerHTML = wrap(inner, outside); return api.approvalCard()!; };
+    // The title stays the only line; the warning is in `extra`.
+    for (const [name, found, text] of [
+      ['a fold-out button', seen(title, '<button>Suspicious Instruction</button>'), 'Suspicious Instruction'],
+      ['an aria-hidden caption', seen(title + '<span aria-hidden="true">Instrucción sospechosa</span>'), 'Instrucción sospechosa'],
+      ['an icon title', seen(title + '<svg><title>Verdächtige Anweisung</title></svg>'), 'Verdächtige Anweisung'],
+      ['an aria-label', seen(title + '<div aria-label="Warning"><span>x</span></div>'), 'Warning'],
+      ['a title attribute', seen(title + '<span title="Unsafe instruction">x</span>'), 'Unsafe instruction'],
+      ['an image description', seen(title + '<img alt="Suspicious Instruction">'), 'Suspicious Instruction'],
+      ['a fold-out dialog button', seen(title, '<button aria-haspopup="dialog">Show details</button>'), 'Show details']
+    ] as const) {
+      expect(found.extra, name).toContain(text);
+      expect(found.lines.some(line => line.includes(text)), name).toBe(false);
+    }
+    // Labels and tooltips inside the shared data are the model's: not reported, and not "words left out".
+    const longTip = 'T'.repeat(200);
+    expect(seen(title + '<dl><div><dt title="' + longTip + '">K</dt><dd title="' + longTip + '" aria-label="' + longTip + '">v</dd></div></dl>')).toMatchObject({ extra: [], cut: false });
+    // More dropped texts than fit, or one that is too long to carry whole: words were left out.
+    const many = Array.from({ length: 9 }, (_, index) => `<button>Option ${index}</button>`).join('');
+    expect(seen(title, many).cut).toBe(true);
+    expect(seen(title, `<button>${'w'.repeat(101)}</button>`).cut).toBe(true);
+    expect(seen(title, `<button>${'w'.repeat(100)}</button>`).cut).toBe(false);
+    // A line of the card's own over 300 characters is cut; a data value that long is not "words left out".
+    expect(seen(`<div>${'x'.repeat(301)}</div>`).cut).toBe(true);
+    expect(seen(title + `<dl><div><dt>K</dt><dd>${'v'.repeat(400)}</dd></div></dl>`).cut).toBe(false);
+  });
+
+  // The app reads the lines back from the page's report, trims and cuts them again, and gives them to the page with
+  // the answer: a line the two sides read differently could never be pressed (a person's Deny included).
+  it('reads the same words back after the app has normalised them, at the 300-character cut and at a split emoji', () => {
+    const main = dom.window.document.querySelector('main')!;
+    const wrap = (inner: string) => `<div data-codex-approval-surface="true"><div role="alert">${inner}</div><button>Ablehnen<kbd>Esc</kbd></button><button>Einmal zulassen<kbd>⏎</kbd></button></div>`;
+    const cases = [
+      '<div>Title?</div><dl><div><dt>K</dt><dd>' + 'x'.repeat(299) + ' tail</dd></div></dl>',
+      '<div>Title?</div><dl><div><dt>K</dt><dd>' + 'x'.repeat(299) + String.fromCodePoint(0x1F600) + ' tail</dd></div></dl>',
+      '<div>Title?</div><dl><div><dt>' + 'k'.repeat(299) + ' </dt><dd>v</dd></div></dl>',
+      '<div>' + 'y'.repeat(299) + ' tail</div>',
+      '<div>Title?</div><div>' + 'z'.repeat(298) + String.fromCharCode(0xA0, 0xA0) + 'x</div>'
+    ];
+    for (const html of cases) {
+      main.innerHTML = wrap(html);
+      const found = api.approvalCard()!;
+      expect(found.lines.every(line => line.length <= 300 && line === line.trim()), html.slice(0, 40)).toBe(true);
+      // What the app holds after reading the report, and what it hands back with the answer.
+      const facts = parseApprovalCard(JSON.stringify({ id: 'card-12345678', lines: found.lines, allow: true, data: found.data, cut: found.cut, extra: found.extra, recheck: true }))!;
+      expect(facts.lines, html.slice(0, 40)).toEqual(found.lines);
+      const words = { lines: facts.lines, data: facts.data ?? null, cut: facts.cut === true, extra: facts.extra ?? [] };
+      expect(api.answerApprovalCard(found.node, 'allow', words), html.slice(0, 40)).toBe('clicked');
+    }
+  });
+
   it('ignores an answered card, a hidden one and one on a kept page', () => {
     const main = dom.window.document.querySelector('main')!;
     main.innerHTML = card('<button disabled>Ablehnen</button><button disabled>Einmal zulassen</button>');
@@ -326,8 +464,9 @@ describe('answering its own connector cards automatically', () => {
   const CORE = 'Chat On Steroids Core';
   let log: string[];
   let deps: ApprovalWaitDeps & { rows: Array<[string, string, string, unknown]>; notices: string[] };
-  const card = (id: string, lines: string[], allow = true) => ({ id, lines, allow });
-  const ours = (id = 'c1', allow = true) => card(id, ['¿Permitir que ChatGPT use Chat On Steroids Core?', 'Run a command.'], allow);
+  const card = (id: string, lines: string[], allow = true): ApprovalCardFacts => ({ id, lines, allow, recheck: true });
+  // The shape of a plain request: the title, the line introducing the shared data, the data rows the page marks.
+  const ours = (id = 'c1', allow = true): ApprovalCardFacts => ({ ...card(id, ['¿Permitir que ChatGPT use Chat On Steroids Core?', 'Los datos compartidos incluyen:', 'Comando: ls'], allow), data: 2 });
   const answered = (chat: string, now: number) => approvalAnswerFor(chat, now);
   const autoAnswers = () => log.filter(line => line.includes('auto-allowed'));
   beforeEach(() => {
@@ -347,7 +486,7 @@ describe('answering its own connector cards automatically', () => {
     await noteApprovalCard('chat', true, 'session', deps, 1_000, ours());
     const answer = answered('chat', 1_100);
     expect(answer).toMatchObject({ cardId: 'c1', choice: 'allow' });
-    expect(autoAnswers()).toEqual(['bridge: chat tool approval card for Chat On Steroids Core auto-allowed (Allow once): ¿Permitir que ChatGPT use Chat On Steroids Core? | Run a command.']);
+    expect(autoAnswers()).toEqual(['bridge: chat tool approval card for Chat On Steroids Core auto-allowed (Allow once): ¿Permitir que ChatGPT use Chat On Steroids Core? | Los datos compartidos incluyen:']);
     // The page reports the press; the card standing for more polls is not answered again.
     expect(settleApprovalAnswer('chat', answer!.token, 'clicked')).toBe(true);
     await noteApprovalCard('chat', true, 'session', deps, 3_000, ours());
@@ -362,7 +501,7 @@ describe('answering its own connector cards automatically', () => {
 
   it('answers a card with the app header first, and each of this install\'s connectors, in any language', async () => {
     const titles: Array<[string[], string]> = [
-      [['Chat On Steroids Core', 'ChatGPT erlauben, Chat On Steroids Core zu verwenden?', 'Startet einen Befehl.'], 'Chat On Steroids Core'],
+      [['Chat On Steroids Core', 'ChatGPT erlauben, Chat On Steroids Core zu verwenden?'], 'Chat On Steroids Core'],
       [['ChatGPTに Chat On Steroids Desktopの使用を許可しますか？'], 'Chat On Steroids Desktop'],
       [['Autoriser ChatGPT à utiliser Chat On Steroids Core ?'], 'Chat On Steroids Core'],
       [['ChatGPT가 Chat On Steroids Core을(를) 사용하도록 허용하시겠습니까?'], 'Chat On Steroids Core'],
@@ -512,5 +651,181 @@ describe('answering its own connector cards automatically', () => {
     expect(deps.rows.map(row => row[2])).toEqual([APPROVAL_WAITING_TEXT]);
     expect(deps.notices).toEqual(['session']);
     expect(autoAnswers()).toHaveLength(1);
+  });
+
+  // 2026-10-29, the owner's decision ("No, exclude them"): a card ChatGPT's safety check raised is never answered
+  // by the app, a card of a type the app does not know is not answered either, and the person is told in the log.
+  const SAFETY_REASON = 'Tool documentation prescribes how to operate the worker tool and suppresses asking the user for settings, attempting to control agent behavior and workflow.';
+
+  it('never answers a safety card, in English or Spanish, even under a plain title, and says so in the log with the heading only', async () => {
+    // The log names the line that raised the alarm: the heading, whatever its place in the card.
+    const safety: Array<[string, string[], string]> = [
+      ['en heading', ['Suspicious Instruction', SAFETY_REASON], 'Suspicious Instruction'],
+      ['en plain title', ['Allow ChatGPT to use Chat On Steroids Core?', 'Suspicious Instruction', SAFETY_REASON], 'Suspicious Instruction'],
+      ['en header and title', [CORE, 'Allow ChatGPT to use Chat On Steroids Core?', 'Suspicious Instruction', SAFETY_REASON], 'Suspicious Instruction'],
+      ['es heading', ['Instrucción sospechosa', 'La documentación de la herramienta intenta controlar el comportamiento del agente.'], 'Instrucción sospechosa'],
+      ['es plain title', ['¿Permitir que ChatGPT use Chat On Steroids Core?', 'Instrucción sospechosa', 'La documentación de la herramienta intenta controlar el comportamiento del agente.'], 'Instrucción sospechosa'],
+      ['es header and title', [CORE, '¿Permitir que ChatGPT use Chat On Steroids Core?', 'INSTRUCCION SOSPECHOSA', 'Texto del motivo'], 'INSTRUCCION SOSPECHOSA']
+    ];
+    for (const [name, lines, heading] of safety) {
+      resetApprovalWaits();
+      log.length = 0;
+      deps.rows.length = 0; deps.notices.length = 0;
+      await noteApprovalCard('chat', true, 'session', deps, 1_000, card('s1', lines));
+      expect(answered('chat', 1_000), name).toBeNull();
+      // The card is redrawn under another id, and again: still never answered, and told once.
+      await noteApprovalCard('chat', true, 'session', deps, 2_000, card('s2', lines));
+      await noteApprovalCard('chat', true, 'session', deps, 3_000, card('s3', lines));
+      expect(answered('chat', 3_000), name).toBeNull();
+      expect(autoAnswers(), name).toEqual([]);
+      const told = log.filter(line => line.includes('safety card waiting'));
+      expect(told, name).toHaveLength(1);
+      // Time is the log's own; the line carries the chat and the card's first line, nothing else from the page.
+      expect(told[0], name).toBe(`bridge: chat safety card waiting: ${heading}`);
+      expect(log.join('\n'), name).not.toContain('worker tool');
+      expect(log.join('\n'), name).not.toContain('comportamiento');
+      // The person is told the usual way: the row at once, the notice after the grace.
+      expect(deps.rows.map(row => row[2]), name).toEqual([APPROVAL_WAITING_TEXT]);
+      await noteApprovalCard('chat', true, 'session', deps, 1_000 + APPROVAL_NOTICE_GRACE_MS, card('s3', lines));
+      expect(deps.notices, name).toEqual(['session']);
+    }
+  });
+
+  it('does not answer a safety card while the setting is off either, and still reports it', async () => {
+    await noteApprovalCard('chat', true, 'session', { ...deps, ownConnectors: () => [] }, 1_000, card('s1', ['Allow ChatGPT to use Chat On Steroids Core?', 'Suspicious Instruction']));
+    expect(answered('chat', 1_000)).toBeNull();
+    expect(log.filter(line => line.includes('safety card waiting'))).toHaveLength(1);
+  });
+
+  it('a safety card does not take the permission card after it with it: the next plain card is answered, the flagged one never', async () => {
+    const flagged = card('f1', ['Allow ChatGPT to use Chat On Steroids Core?', 'Suspicious Instruction']);
+    await noteApprovalCard('chat', true, 'session', deps, 1_000, flagged);
+    expect(answered('chat', 1_000)).toBeNull();
+    await noteApprovalCard('chat', false, 'session', deps, 2_000);
+    await noteApprovalCard('chat', true, 'session', deps, 2_000 + APPROVAL_GONE_MS, ours('plain'));
+    expect(answered('chat', 2_000 + APPROVAL_GONE_MS)).toMatchObject({ cardId: 'plain', choice: 'allow' });
+  });
+
+  it('a card reworded into a safety card in the same element is not answered, and the earlier answer is dropped', async () => {
+    await noteApprovalCard('chat', true, 'session', deps, 1_000, ours('same'));
+    expect(answered('chat', 1_000)).toMatchObject({ cardId: 'same' });
+    await noteApprovalCard('chat', true, 'session', deps, 1_500, card('same', ['Allow ChatGPT to use Chat On Steroids Core?', 'Suspicious Instruction']));
+    expect(answered('chat', 1_500)).toBeNull();
+    expect(log.some(line => line.includes('safety card waiting'))).toBe(true);
+  });
+
+  it('presses a permission request once, and the answer carries the words it was judged on', async () => {
+    const lines = ['¿Permitir que ChatGPT use Chat On Steroids Core?', 'Los datos compartidos incluyen:', 'Comando: ls'];
+    await noteApprovalCard('chat', true, 'session', deps, 1_000, { ...card('p1', lines), data: 2 });
+    const answer = answered('chat', 1_000);
+    expect(answer).toMatchObject({ cardId: 'p1', choice: 'allow', words: { lines, data: 2, cut: false, extra: [] } });
+    expect(autoAnswers()).toHaveLength(1);
+    expect(log.some(line => line.includes('safety card waiting'))).toBe(false);
+    settleApprovalAnswer('chat', answer!.token, 'clicked');
+    await noteApprovalCard('chat', true, 'session', deps, 3_000, { ...card('p1', lines), data: 2 });
+    expect(answered('chat', 3_000)).toBeNull();
+    expect(autoAnswers()).toHaveLength(1);
+  });
+
+  it('does not press a card of an unknown type, and reports one that mentions this app', async () => {
+    const unknown: Array<[string, ApprovalCardFacts]> = [
+      ['no ChatGPT in front of the name', card('u1', ['Allow Chat On Steroids Core?'])],
+      ['a heading that is not the app', card('u2', ['Review needed', 'Allow ChatGPT to use Chat On Steroids Core?'])],
+      ['a title that is not a question', card('u3', ['ChatGPT wants to use Chat On Steroids Core'])],
+      ['words the page left out', { ...ours('u4'), cut: true }],
+      ['another sentence in front of the name', card('u5', ['Heads up. ChatGPT wants to use Chat On Steroids Core?'])]
+    ];
+    for (const [name, unknownCard] of unknown) {
+      resetApprovalWaits();
+      log.length = 0;
+      await noteApprovalCard('chat', true, 'session', deps, 1_000, unknownCard);
+      expect(answered('chat', 1_000), name).toBeNull();
+      expect(autoAnswers(), name).toEqual([]);
+      expect(log.filter(line => line.includes('safety card waiting (not recognised')), name).toHaveLength(1);
+      expect(approvalCardWaiting('chat', 1_000), name).toBe(true);
+    }
+  });
+
+  it('does not press a card from a page that cannot re-check the card, and says what to do', async () => {
+    await noteApprovalCard('chat', true, 'session', deps, 1_000, { ...ours('old'), recheck: false });
+    await noteApprovalCard('chat', true, 'session', deps, 1_500, { ...ours('old2'), recheck: undefined });
+    expect(answered('chat', 1_500)).toBeNull();
+    expect(autoAnswers()).toEqual([]);
+    expect(log.filter(line => line.includes('does not re-check the card before pressing'))).toHaveLength(2);
+  });
+
+  it('a word that only the shared data carries does not hold back a permission request, as the page counts the data', async () => {
+    const lines = ['Allow ChatGPT to use Chat On Steroids Core?', 'The shared data includes:', 'Command: rg "Suspicious Instruction" docs'];
+    await noteApprovalCard('chat', true, 'session', deps, 1_000, { ...card('d1', lines), data: 2 });
+    expect(answered('chat', 1_000)).toMatchObject({ cardId: 'd1', choice: 'allow' });
+    // Without the page's data marker the same words are the card's own, and it is left to a person.
+    resetApprovalWaits();
+    await noteApprovalCard('chat', true, 'session', deps, 1_000, card('d2', lines));
+    expect(answered('chat', 1_000)).toBeNull();
+  });
+
+  it('reads the page\'s report: the re-check flag, the cut flag and where the data starts, and nothing else', () => {
+    const base = { id: 'card-12345678', lines: ['a', 'b', 'c'], allow: true };
+    expect(parseApprovalCard(JSON.stringify(base))).toEqual({ ...base, cut: false, recheck: false, extra: [] });
+    expect(parseApprovalCard(JSON.stringify({ ...base, recheck: true, cut: true, data: 2, extra: ['Deny', 4, ' Allow once '] }))).toEqual({ ...base, recheck: true, cut: true, data: 2, extra: ['Deny', 'Allow once'] });
+    // Only a real `true` counts, and a data index must be a whole number inside the lines.
+    expect(parseApprovalCard(JSON.stringify({ ...base, recheck: 'yes', cut: 1 }))).toEqual({ ...base, cut: false, recheck: false, extra: [] });
+    for (const data of [-1, 1.5, 4, 'x', null]) expect(parseApprovalCard(JSON.stringify({ ...base, data }))).toEqual({ ...base, cut: false, recheck: false, extra: [] });
+  });
+
+  it('logs only the card\'s own first lines when it answers: a key or a path in the shared data stays out of the log', async () => {
+    const lines = ['Allow ChatGPT to use Chat On Steroids Core?', 'The shared data includes:', 'Access key: sk-proj-FAKE0123', 'Folder: C:/Users/someone/secret'];
+    await noteApprovalCard('chat', true, 'session', deps, 1_000, { ...card('k1', lines), data: 2 });
+    expect(answered('chat', 1_000)).toMatchObject({ cardId: 'k1' });
+    expect(autoAnswers()).toEqual(['bridge: chat tool approval card for Chat On Steroids Core auto-allowed (Allow once): Allow ChatGPT to use Chat On Steroids Core? | The shared data includes:']);
+    expect(log.join('\n')).not.toContain('sk-proj');
+    expect(log.join('\n')).not.toContain('someone');
+    // A card with no line between the title and the data rows: the first data row is not the card's second line.
+    log.length = 0;
+    await noteApprovalCard('other', true, 'session', deps, 1_000, { ...card('k2', [lines[0]!, lines[2]!, lines[3]!]), data: 1 });
+    expect(autoAnswers()).toEqual(['bridge: other tool approval card for Chat On Steroids Core auto-allowed (Allow once): Allow ChatGPT to use Chat On Steroids Core?']);
+    expect(log.join('\n')).not.toContain('sk-proj');
+  });
+
+  it('a card whose shape is not known says so in the log in numbers, without its words', async () => {
+    const lines = ['Allow ChatGPT to use Chat On Steroids Core?', 'Instrucció sospitosa', 'Una frase que descriu el motiu.'];
+    await noteApprovalCard('chat', true, 'session', deps, 1_000, card('c1', lines));
+    expect(answered('chat', 1_000)).toBeNull();
+    expect(log.filter(line => line.includes('safety card waiting'))).toEqual([
+      'bridge: chat safety card waiting (not recognised as a plain permission request: 3 own lines, 0 data lines): Allow ChatGPT to use Chat On Steroids Core?'
+    ]);
+    expect(log.join('\n')).not.toContain('sospitosa');
+    expect(log.join('\n')).not.toContain('motiu');
+  });
+
+  it('a person\'s Deny holds for the whole episode, not only ten minutes: a card redrawn later in it is never answered by the app', async () => {
+    await noteApprovalCard('chat', true, 'session', deps, 1_000, ours('first'));
+    const auto = answered('chat', 1_000)!;
+    expect(settleApprovalAnswer('chat', auto.token, 'unavailable')).toBe(true);
+    const denial = requestApprovalAnswer('chat', 'first', 'deny', 2_000);
+    expect(denial.ok).toBe(true);
+    if (denial.ok) settleApprovalAnswer('chat', denial.token, 'card_changed');
+    // The Deny did not take, the card stands, and ChatGPT draws it again under another id long after the pause: still the person's.
+    const later = 2_000 + AUTO_PAUSE_AFTER_DENY_MS + 60_000;
+    for (let at = 3_000; at < later; at += 60_000) await noteApprovalCard('chat', true, 'session', deps, at, ours('first'));
+    await noteApprovalCard('chat', true, 'session', deps, later, ours('redrawn'));
+    expect(answered('chat', later)).toBeNull();
+    expect(log.some(line => line.includes('pressed Deny in the app'))).toBe(true);
+  });
+
+  it('a card that changes only in what the page cut or where it puts the data is a new request, answered afresh or not at all', async () => {
+    const lines = ['Allow ChatGPT to use Chat On Steroids Core?', 'The shared data includes:', 'Command: ls'];
+    await noteApprovalCard('chat', true, 'session', deps, 1_000, { ...card('same', lines), data: 2 });
+    expect(answered('chat', 1_000)).toMatchObject({ cardId: 'same' });
+    // Same element, same lines; the page now says words were cut: the earlier answer is dropped and the card is judged again.
+    await noteApprovalCard('chat', true, 'session', deps, 1_500, { ...card('same', lines), data: 2, cut: true });
+    expect(answered('chat', 1_500)).toBeNull();
+    expect(log.some(line => line.includes('safety card waiting (not recognised'))).toBe(true);
+    // The same for a changed data index, and for a changed dropped text (a warning drawn as a button).
+    await noteApprovalCard('chat', true, 'session', deps, 2_000, { ...card('same', lines), data: 1 });
+    expect(answered('chat', 2_000)).toMatchObject({ cardId: 'same', words: { data: 1, cut: false } });
+    await noteApprovalCard('chat', true, 'session', deps, 2_500, { ...card('same', lines), data: 2, extra: ['Suspicious Instruction'] });
+    expect(answered('chat', 2_500)).toBeNull();
+    expect(log.filter(line => line.includes('safety card waiting: Suspicious Instruction'))).toHaveLength(1);
   });
 });

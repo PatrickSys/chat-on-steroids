@@ -3987,7 +3987,9 @@ function approvalQuery(message) {
   const card = message.approvalCard;
   if (card && typeof card === 'object' && typeof card.id === 'string' && Array.isArray(card.lines)) {
     const lines = card.lines.filter(line => typeof line === 'string').slice(0, 8).map(line => line.slice(0, 300));
-    query += `&approvalCard=${encodeURIComponent(JSON.stringify({ id: card.id.slice(0, 64), lines, allow: card.allow === true }))}`;
+    const data = Number.isInteger(card.data) && card.data >= 0 && card.data <= lines.length ? card.data : undefined;
+    const extra = Array.isArray(card.extra) ? card.extra.filter(text => typeof text === 'string').slice(0, 8).map(text => text.slice(0, 100)) : [];
+    query += `&approvalCard=${encodeURIComponent(JSON.stringify({ id: card.id.slice(0, 64), lines, allow: card.allow === true, cut: card.cut === true, data, extra, recheck: card.recheck === true }))}`;
   }
   const result = message.approvalResult;
   if (result && typeof result === 'object' && typeof result.token === 'string' && typeof result.outcome === 'string')

@@ -19674,6 +19674,80 @@ describe('one live isolated-world recorder per document', () => {
     expect(await live.runtimeMessage({ type: 'clf-recorder-ping' })).toMatchObject({ busy: false });
   });
 
+  // 2026-10-29: the app answers a card for its own connector by itself; the page presses only a card that still says
+  // what the answer was given for, and tells the app it can (older pages do not, and are never trusted to press alone).
+  it('reports that it re-checks the approval card, and presses an answer only while the card says what it was given for', async () => {
+    live = await harness();
+    const card = live.document.createElement('div');
+    card.setAttribute('data-codex-approval-surface', 'true');
+    card.innerHTML = '<div role="alert"><div>Allow ChatGPT to use Chat On Steroids Core?</div><div>Runs a command.</div></div>' +
+      '<button>Deny<kbd>Esc</kbd></button><button>Allow once<kbd>⏎</kbd></button>';
+    card.getClientRects = () => [{ width: 600, height: 200 }] as unknown as DOMRectList;
+    live.document.body.append(card);
+    const clicks: string[] = [];
+    for (const button of card.querySelectorAll('button')) button.addEventListener('click', () => clicks.push(button.textContent!));
+    const asked: any[] = [];
+    let answer: unknown = null;
+    live.reply.set('activity', (message) => {
+      asked.push(message);
+      const data = { entries: [], job: null, ...(answer ? { approvalAnswer: answer } : {}) };
+      answer = null;
+      return { ok: true, data };
+    });
+    await live.hook.pullActivity();
+    await settle();
+    const lines = ['Allow ChatGPT to use Chat On Steroids Core?', 'Runs a command.'];
+    const words = { lines, data: 2, cut: false, extra: [] };
+    expect(asked[0]).toMatchObject({ approval: true, approvalCard: { ...words, allow: true, recheck: true } });
+    const cardId = asked[0].approvalCard.id;
+
+    // The element now holds a safety card: an answer given for the plain card is not pressed.
+    card.querySelector('div[role="alert"] > div')!.textContent = 'Suspicious Instruction';
+    answer = { token: 'answer-token-1', cardId, choice: 'allow', words };
+    await live.hook.pullActivity();
+    await settle();
+    expect(clicks).toEqual([]);
+    await live.hook.pullActivity();
+    await settle();
+    expect(asked.at(-1)).toMatchObject({ approvalResult: { token: 'answer-token-1', outcome: 'card_changed' } });
+
+    // The card says what the answer was given for: pressed once; a token is never carried out twice.
+    card.querySelector('div[role="alert"] > div')!.textContent = lines[0]!;
+    answer = { token: 'answer-token-2', cardId, choice: 'allow', words };
+    await live.hook.pullActivity();
+    await settle();
+    expect(clicks).toEqual(['Allow once⏎']);
+    answer = { token: 'answer-token-2', cardId, choice: 'allow', words };
+    await live.hook.pullActivity();
+    await settle();
+    expect(clicks).toHaveLength(1);
+
+    // An answer that names other words than the card shows is not pressed, whatever the element.
+    answer = { token: 'answer-token-3', cardId, choice: 'allow', words: { ...words, lines: ['Allow ChatGPT to use Chat On Steroids Core?', 'Deletes a folder.'] } };
+    await live.hook.pullActivity();
+    await settle();
+    expect(clicks).toHaveLength(1);
+    // A warning drawn as a hidden part or a label after the decision changes the card too, though its lines are the same.
+    const hidden = live.document.createElement('span');
+    hidden.setAttribute('aria-hidden', 'true');
+    hidden.textContent = 'Warning';
+    card.append(hidden);
+    answer = { token: 'answer-token-4', cardId, choice: 'allow', words };
+    await live.hook.pullActivity();
+    await settle();
+    expect(clicks).toHaveLength(1);
+    hidden.remove();
+    // An answer whose words are not an object, or are null, is never pressed; an answer from an app before (no words) is.
+    answer = { token: 'answer-token-5', cardId, choice: 'allow', words: null };
+    await live.hook.pullActivity();
+    await settle();
+    expect(clicks).toHaveLength(1);
+    answer = { token: 'answer-token-6', cardId, choice: 'allow' };
+    await live.hook.pullActivity();
+    await settle();
+    expect(clicks).toHaveLength(2);
+  });
+
   it('reports the recorder protocol version rather than the unrelated Fiber protocol version', async () => {
     live = await harness();
 

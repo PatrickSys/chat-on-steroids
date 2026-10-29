@@ -9781,17 +9781,19 @@ describe('unattributed activity recovery', () => {
     const { resetApprovalWaits } = await import('../src/main/approval-wait.js');
     resetApprovalWaits();
     await pair();
-    const poll = async (id: string, title: string, allow = true) => (await request('GET', `/activity?conversationId=${PRIME}&approval=1&approvalCard=${
-      encodeURIComponent(JSON.stringify({ id, lines: [title, 'Runs one command.'], allow }))}`)).body.approvalAnswer;
+    const poll = async (id: string, title: string, allow = true, recheck = true) => (await request('GET', `/activity?conversationId=${PRIME}&approval=1&approvalCard=${
+      encodeURIComponent(JSON.stringify({ id, lines: [title, 'The shared data includes:', 'Command: ls'], data: 2, allow, recheck }))}`)).body.approvalAnswer;
     const core = 'Allow ChatGPT to use Chat On Steroids Core?';
     expect(await poll('approval-card-gmail', 'Allow ChatGPT to use Gmail?')).toBeUndefined();
     expect(await poll('approval-card-disabled', core, false)).toBeUndefined();
+    // A page that does not re-read the card's words before pressing (an older extension) is not asked to press by itself.
+    expect(await poll('approval-card-old-page', core, true, false)).toBeUndefined();
     const own = await poll('approval-card-own-1', core);
     expect(own).toMatchObject({ cardId: 'approval-card-own-1', choice: 'allow' });
     // The same card on the next poll is not answered a second time; the page reports the press instead.
     const token = own.token;
     expect(await poll('approval-card-own-1', core)).toMatchObject({ token });
-    await request('GET', `/activity?conversationId=${PRIME}&approval=1&approvalCard=${encodeURIComponent(JSON.stringify({ id: 'approval-card-own-1', lines: [core, 'Runs one command.'], allow: true }))}&approvalResult=${encodeURIComponent(JSON.stringify({ token, outcome: 'clicked' }))}`);
+    await request('GET', `/activity?conversationId=${PRIME}&approval=1&approvalCard=${encodeURIComponent(JSON.stringify({ id: 'approval-card-own-1', lines: [core, 'The shared data includes:', 'Command: ls'], data: 2, allow: true, recheck: true }))}&approvalResult=${encodeURIComponent(JSON.stringify({ token, outcome: 'clicked' }))}`);
     expect(await poll('approval-card-own-1', core)).toBeUndefined();
     await saveConfig({ ...getConfig(), ui: { ...getConfig().ui, autoAllowApproval: false } });
     try {

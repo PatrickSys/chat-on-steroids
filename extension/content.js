@@ -7117,13 +7117,14 @@
     const card = CLF_DOM.approvalCard();
     if (!card) return null;
     if (!approvalCardIds.has(card.node)) approvalCardIds.set(card.node, crypto.randomUUID());
-    return { id: approvalCardIds.get(card.node), lines: card.lines, allow: card.allow, node: card.node };
+    return { id: approvalCardIds.get(card.node), lines: card.lines, allow: card.allow, cut: card.cut === true, data: card.data, extra: card.extra, node: card.node };
   }
   function answerApproval(answer) {
     if (!answer || typeof answer.token !== 'string' || approvalTokensDone.has(answer.token)) return;
     approvalTokensDone.add(answer.token);
     const card = currentApprovalCard();
-    const outcome = card && card.id === answer.cardId ? CLF_DOM.answerApprovalCard(card.node, answer.choice) : 'card_changed';
+    // An answer that carries the card it was given for is pressed only if the card still reads exactly so (read again right there).
+    const outcome = card && card.id === answer.cardId ? CLF_DOM.answerApprovalCard(card.node, answer.choice, 'words' in answer ? answer.words : undefined) : 'card_changed';
     approvalResult = { token: answer.token, outcome };
     setTimeout(() => void pullActivity(), 400);
   }
@@ -7158,7 +7159,8 @@
         // ChatGPT's own approval card: the turn waits for a person, so the app tells them and
         // shows its words, and an answer given in the app comes back on this same feed.
         approval: Boolean(approvalCard),
-        ...(approvalCard ? { approvalCard: { id: approvalCard.id, lines: approvalCard.lines, allow: approvalCard.allow } } : {}),
+        // `recheck`: this page re-reads the words before it presses, which the app asks of a page before it answers a card by itself.
+        ...(approvalCard ? { approvalCard: { id: approvalCard.id, lines: approvalCard.lines, allow: approvalCard.allow, cut: approvalCard.cut, data: approvalCard.data, extra: approvalCard.extra, recheck: true } } : {}),
         ...(sentResult ? { approvalResult: sentResult } : {})
       });
       if (sentResult && reply && reply.ok === true && approvalResult === sentResult) approvalResult = null;

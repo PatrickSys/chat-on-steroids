@@ -3817,5 +3817,7 @@
   "Refused to check a step for you": "已拒绝查看需要你执行的步骤",
   "From the sub-agent “{0}”": "来自子智能体“{0}”",
   "Run it yourself, in your own terminal: Chat On Steroids does not run or check it.": "请在你自己的终端中亲自运行：Chat On Steroids 不会运行或检查它。",
-  "{0} expected files": "{0} 个预期文件"
+  "{0} expected files": "{0} 个预期文件",
+  "Answer tool approvals automatically": "自动回应工具批准",
+  "ChatGPT asks \"Allow ChatGPT to use Chat On Steroids …?\" again in every new chat and after a page reload, even after you chose Always allow. When on, the app presses Allow once on cards that name Chat On Steroids, so a run never waits for you, and logs each answer. This includes cards ChatGPT's safety check raised: a web page or file that steers the model can then run commands without you looking. Turn it off to approve each card yourself.": "即使你选择了“始终允许”，ChatGPT 仍会在每个新聊天中以及页面重新加载后再次询问“是否允许 ChatGPT 使用 Chat On Steroids …？”。开启后，应用会在提到 Chat On Steroids 的卡片上点击“允许一次”，让运行不必等你，并记录每次回应。这也包括 ChatGPT 安全检查弹出的卡片：引导模型的网页或文件可能在你没看到时执行命令。关闭后可自行批准每张卡片。"
 }

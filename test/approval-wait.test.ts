@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { JSDOM } from 'jsdom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  APPROVAL_ANSWER_MS, APPROVAL_FRESH_MS, APPROVAL_GONE_MS, APPROVAL_NOTICE_GRACE_MS, approvalAnswerFor, approvalCardView, approvalCardWaiting, approvalWaitingChats, noteApprovalCard,
+  APPROVAL_ANSWER_MS, APPROVAL_FRESH_MS, AUTO_ANSWERS_PER_EPISODE, AUTO_PAUSE_AFTER_DENY_MS, APPROVAL_GONE_MS, APPROVAL_NOTICE_GRACE_MS, approvalAnswerFor, approvalCardView, approvalCardWaiting, approvalWaitingChats, cardNamedConnector, noteApprovalCard,
   requestApprovalAnswer, resetApprovalWaits, settleApprovalAnswer, type ApprovalWaitDeps
 } from '../src/main/approval-wait.js';
 import { APPROVAL_ANSWERED_TEXT, APPROVAL_WAITING_TEXT } from '../src/shared/approval-wait.js';
@@ -171,8 +171,8 @@ describe('the session list view', () => {
   });
 });
 
-// The maintainer asked to answer the card from the app (2026-10-14). The app only ever relays a
-// person's click, for the exact card it showed them; it never answers on its own.
+// The maintainer asked to answer the card from the app (2026-10-14). The app relays a person's click,
+// for the exact card it showed them; its own connectors' cards are answered by the block at the end.
 describe('answering the card from the app', () => {
   let deps: ApprovalWaitDeps;
   const card = (id: string, allow = true) => ({ id, lines: ['Gmail', 'Allow ChatGPT to use Gmail?', 'Creates a draft.'], allow });
@@ -316,5 +316,201 @@ describe('the page detector', () => {
     expect(api.approvalWaiting()).toBe(false);
     main.innerHTML = `<div data-app-shell-page-surface style="display:none">${card()}</div>`;
     expect(api.approvalWaiting()).toBe(false);
+  });
+});
+
+// 2026-10-29: ChatGPT asked "Allow ChatGPT to use Chat On Steroids Core?" again in every new chat and after
+// each page reload, although Always allow was chosen, and a Pro run waited half an hour for a click. The app
+// now presses Allow once on cards that name its own connectors, and on nothing else.
+describe('answering its own connector cards automatically', () => {
+  const CORE = 'Chat On Steroids Core';
+  let log: string[];
+  let deps: ApprovalWaitDeps & { rows: Array<[string, string, string, unknown]>; notices: string[] };
+  const card = (id: string, lines: string[], allow = true) => ({ id, lines, allow });
+  const ours = (id = 'c1', allow = true) => card(id, ['¿Permitir que ChatGPT use Chat On Steroids Core?', 'Run a command.'], allow);
+  const answered = (chat: string, now: number) => approvalAnswerFor(chat, now);
+  const autoAnswers = () => log.filter(line => line.includes('auto-allowed'));
+  beforeEach(() => {
+    resetApprovalWaits();
+    log = [];
+    const rows: Array<[string, string, string, unknown]> = [], notices: string[] = [];
+    deps = {
+      rows, notices,
+      record: async (sessionId, progressId, text, anchor) => { rows.push([sessionId, progressId, text, anchor]); return anchor ?? { seq: 1, time: 1 }; },
+      notify: sessionId => { notices.push(sessionId); },
+      log: message => { log.push(message); },
+      ownConnectors: () => [CORE, 'Chat On Steroids Desktop']
+    };
+  });
+
+  it('files Allow once for the card, once, and logs what the card said', async () => {
+    await noteApprovalCard('chat', true, 'session', deps, 1_000, ours());
+    const answer = answered('chat', 1_100);
+    expect(answer).toMatchObject({ cardId: 'c1', choice: 'allow' });
+    expect(autoAnswers()).toEqual(['bridge: chat tool approval card for Chat On Steroids Core auto-allowed (Allow once): ¿Permitir que ChatGPT use Chat On Steroids Core? | Run a command.']);
+    // The page reports the press; the card standing for more polls is not answered again.
+    expect(settleApprovalAnswer('chat', answer!.token, 'clicked')).toBe(true);
+    await noteApprovalCard('chat', true, 'session', deps, 3_000, ours());
+    await noteApprovalCard('chat', true, 'session', deps, 5_000, ours());
+    expect(answered('chat', 5_000)).toBeNull();
+    expect(autoAnswers()).toHaveLength(1);
+    // The next card of the same chat is a new request and is answered too.
+    await noteApprovalCard('chat', false, 'session', deps, 6_000);
+    await noteApprovalCard('chat', true, 'session', deps, 6_000 + APPROVAL_GONE_MS, ours('c2'));
+    expect(answered('chat', 6_000 + APPROVAL_GONE_MS)).toMatchObject({ cardId: 'c2', choice: 'allow' });
+  });
+
+  it('answers a card with the app header first, and each of this install\'s connectors, in any language', async () => {
+    const titles: Array<[string[], string]> = [
+      [['Chat On Steroids Core', 'ChatGPT erlauben, Chat On Steroids Core zu verwenden?', 'Startet einen Befehl.'], 'Chat On Steroids Core'],
+      [['ChatGPTに Chat On Steroids Desktopの使用を許可しますか？'], 'Chat On Steroids Desktop'],
+      [['Autoriser ChatGPT à utiliser Chat On Steroids Core ?'], 'Chat On Steroids Core'],
+      [['ChatGPT가 Chat On Steroids Core을(를) 사용하도록 허용하시겠습니까?'], 'Chat On Steroids Core'],
+      [['是否允许 ChatGPT 使用 Chat On Steroids Core？'], 'Chat On Steroids Core'],
+      [['ChatGPT\'nin Chat On Steroids Core kullanmasına izin verilsin mi?'], 'Chat On Steroids Core'],
+      [['ChatGPT\'nin Chat On Steroids Core uygulamasını kullanmasına izin vermek istiyor musunuz?'], 'Chat On Steroids Core'],
+      // CJK titles are written without spaces around Latin words, and may quote the name.
+      [['是否允许ChatGPT使用Chat On Steroids Core？'], 'Chat On Steroids Core'],
+      [['ChatGPTにChat On Steroids Coreの使用を許可しますか？'], 'Chat On Steroids Core'],
+      [['ChatGPTに「Chat On Steroids Core」の使用を許可しますか？'], 'Chat On Steroids Core'],
+      [['ChatGPT가 Chat On Steroids Core(을)를 사용하도록 허용하시겠습니까?'], 'Chat On Steroids Core'],
+      [['Разрешить ChatGPT использовать «Chat On Steroids Core»?'], 'Chat On Steroids Core']
+    ];
+    for (const [lines, name] of titles) {
+      expect(cardNamedConnector(lines, [CORE, 'Chat On Steroids Desktop']), lines[0]).toBe(name);
+      resetApprovalWaits();
+      await noteApprovalCard('chat', true, null, deps, 1_000, card('h1', lines));
+      expect(answered('chat', 1_000), lines[0]).toMatchObject({ cardId: 'h1', choice: 'allow' });
+    }
+  });
+
+  it('answers nothing when the setting is off, or the names cannot be read, whatever the card says', async () => {
+    for (const off of [undefined, () => [], () => { throw new Error('config unreadable'); }]) {
+      resetApprovalWaits();
+      await noteApprovalCard('chat', true, 'session', { ...deps, ownConnectors: off }, 1_000, ours());
+      expect(answered('chat', 1_000)).toBeNull();
+      // The wait is still noted, with its row, so the stall can never go unseen.
+      expect(approvalCardWaiting('chat', 1_000)).toBe(true);
+    }
+    expect(autoAnswers()).toEqual([]);
+    expect(log.some(line => line.includes('could not be answered automatically: config unreadable'))).toBe(true);
+    expect(deps.rows.length).toBeGreaterThan(0);
+  });
+
+  it('leaves to a person: other apps, a quoted name, a warning header, siblings, a disabled Allow', async () => {
+    const strangers = [
+      card('g1', ['Gmail', 'Allow ChatGPT to use Gmail?', 'Creates a draft.']),
+      // The name appears only in what the other app wants to do, or in a second line the model wrote.
+      card('g2', ['Allow ChatGPT to use GitHub?', 'Chat On Steroids Core?']),
+      card('g3', ['GitHub', 'Allow ChatGPT to use GitHub?', 'Comments on the issue "Does Chat On Steroids Core work?"']),
+      card('g4', ['ChatGPT wants to use GitHub', 'Body: is Chat On Steroids Core ok?']),
+      // ChatGPT's own safety check raised the card: a header that is not the app's name.
+      card('w1', ['Suspicious instruction', 'Allow ChatGPT to use Chat On Steroids Core?', 'The tool description tries to dictate its own handling.']),
+      card('w2', ['Chat On Steroids Core was flagged', 'Allow ChatGPT to use Chat On Steroids Core?']),
+      // Siblings of the name, with every separator a person might type.
+      ...['Core (Laptop)', 'Core — LAP-PACO2', 'Core Laptop', 'Core 2', 'Core2', 'Core [Laptop]', 'Core: LAP-PACO2', 'Core, Laptop', 'Core.old',
+        'Core ‐ LAP', 'Core • LAP', 'Core（Laptop）', 'Coreé', 'Core-Laptop', 'Core_2',
+        // Symbols, capitals of other scripts, emoji and dots after the name.
+        'Core @lap', 'Core ~', 'Core +', 'Core &', "Core 'lap'", 'Core \u2212', 'Core \u30FB', 'Core\uFF1Alap', 'Core \uD83D\uDE42', 'Core \u00C9quipe',
+        'Core \u041D\u043E\u0443\u0442', 'Core\u00B7x', '(Laptop)Core'].map((tail, index) =>
+        card(`s${index}`, [`Allow ChatGPT to use Chat On Steroids ${tail}?`])),
+      card('s-head', ['Allow ChatGPT to use My-Chat On Steroids Core?']),
+      card('n1', ['Chat On Steroids Core wants to run a command.']),
+      card('l1', ['Allow ChatGPT to use Chat On Steroids Core? ' + 'x'.repeat(200) + '?']),
+      ours('d1', false)
+    ];
+    for (const stranger of strangers) {
+      resetApprovalWaits();
+      await noteApprovalCard('chat', true, 'session', deps, 1_000, stranger);
+      expect(answered('chat', 1_000), stranger.id).toBeNull();
+      expect(approvalCardWaiting('chat', 1_000), stranger.id).toBe(true);
+    }
+    expect(autoAnswers()).toEqual([]);
+  });
+
+  it('matches a name that carries this computer\'s suffix exactly, and no other suffix', () => {
+    const named = ['Chat On Steroids Core (Windows)'];
+    expect(cardNamedConnector(['Allow ChatGPT to use Chat On Steroids Core (Windows)?'], named)).toBe(named[0]);
+    expect(cardNamedConnector(['Allow ChatGPT to use Chat On Steroids Core?'], named)).toBeNull();
+    expect(cardNamedConnector(['Allow ChatGPT to use Chat On Steroids Core (Mac)?'], named)).toBeNull();
+    expect(cardNamedConnector(['Allow ChatGPT to use Chat On Steroids Core (Windows) (2)?'], named)).toBeNull();
+    expect(cardNamedConnector([], named)).toBeNull();
+  });
+
+  it('treats other words under the same card element as a new request, and drops the old answer', async () => {
+    await noteApprovalCard('chat', true, 'session', deps, 1_000, ours('same'));
+    expect(answered('chat', 1_000)).toMatchObject({ cardId: 'same' });
+    // ChatGPT reuses the element for a request about something else: the old answer must not ride along.
+    await noteApprovalCard('chat', true, 'session', deps, 1_500, card('same', ['Allow ChatGPT to use Gmail?', 'Sends an email.']));
+    expect(answered('chat', 1_500)).toBeNull();
+    expect(autoAnswers()).toHaveLength(1);
+  });
+
+  it('keeps a run of answered cards apart: no merged episode, no row, no "needs you" notice', async () => {
+    // Each card is answered and the model's next call, with the same words, comes after the redraw window.
+    let at = 1_000;
+    for (let index = 0; index < 12; index++) {
+      await noteApprovalCard('chat', true, 'session', deps, at, ours(`run-${index}`));
+      const answer = answered('chat', at)!;
+      expect(answer.cardId).toBe(`run-${index}`);
+      settleApprovalAnswer('chat', answer.token, 'clicked');
+      at += 1_500;
+      await noteApprovalCard('chat', false, 'session', deps, at);
+      at += APPROVAL_GONE_MS + 1_000;
+    }
+    expect(autoAnswers()).toHaveLength(12);
+    expect(deps.notices).toEqual([]);
+    expect(deps.rows).toEqual([]);
+    expect(log.some(line => line.includes('redrawn, not answered'))).toBe(false);
+  });
+
+  it('stops after a few answers when a card keeps coming back, and the person is told after the usual grace', async () => {
+    // The page reports the press, ChatGPT draws the same card again at once, and again: a loop, not a run of calls.
+    let at = 1_000;
+    for (let index = 0; index < 40; index++) {
+      await noteApprovalCard('chat', true, 'session', deps, at, ours(`loop-${index}`));
+      const answer = answered('chat', at);
+      if (answer) settleApprovalAnswer('chat', answer.token, 'clicked');
+      at += 500;
+      await noteApprovalCard('chat', false, 'session', deps, at);
+      at += 500;
+    }
+    expect(autoAnswers()).toHaveLength(AUTO_ANSWERS_PER_EPISODE);
+    expect(log.some(line => line.includes('came back'))).toBe(true);
+    // 30 s after the first card the row and the notice came, as for any card nobody answers.
+    expect(deps.notices).toEqual(['session']);
+    expect(deps.rows.some(row => row[2] === APPROVAL_WAITING_TEXT)).toBe(true);
+  });
+
+  it('does not override a person\'s Deny in the app: no automatic answer in that chat for a while', async () => {
+    await noteApprovalCard('chat', true, 'session', deps, 1_000, ours('first'));
+    const auto = answered('chat', 1_000)!;
+    // The automatic press did not take; the person reads the card and presses Deny in the app.
+    expect(settleApprovalAnswer('chat', auto.token, 'unavailable')).toBe(true);
+    const denial = requestApprovalAnswer('chat', 'first', 'deny', 2_000);
+    expect(denial.ok).toBe(true);
+    if (denial.ok) settleApprovalAnswer('chat', denial.token, 'clicked');
+    await noteApprovalCard('chat', false, 'session', deps, 3_000);
+    // The model sends the same call again at once: it stays for the person.
+    await noteApprovalCard('chat', true, 'session', deps, 3_000 + APPROVAL_GONE_MS, ours('retry'));
+    expect(answered('chat', 3_000 + APPROVAL_GONE_MS)).toBeNull();
+    expect(log.some(line => line.includes('pressed Deny in the app'))).toBe(true);
+    // Another chat is not affected, and this one is answered again once the pause is over.
+    await noteApprovalCard('other', true, null, deps, 4_000, ours('elsewhere'));
+    expect(answered('other', 4_000)).toMatchObject({ cardId: 'elsewhere' });
+    await noteApprovalCard('chat', false, 'session', deps, 5_000);
+    await noteApprovalCard('chat', true, 'session', deps, 5_000 + AUTO_PAUSE_AFTER_DENY_MS, ours('later'));
+    expect(answered('chat', 5_000 + AUTO_PAUSE_AFTER_DENY_MS)).toMatchObject({ cardId: 'later' });
+  });
+
+  it('still tells the person when the app\'s own answer did not take, after the usual grace', async () => {
+    await noteApprovalCard('chat', true, 'session', deps, 1_000, ours());
+    expect(answered('chat', 1_000)).toMatchObject({ cardId: 'c1' });
+    expect(deps.rows).toEqual([]);
+    // The page never pressed it: the card stands on, so the row and the notice come as for any card.
+    await noteApprovalCard('chat', true, 'session', deps, 1_000 + APPROVAL_NOTICE_GRACE_MS, ours());
+    expect(deps.rows.map(row => row[2])).toEqual([APPROVAL_WAITING_TEXT]);
+    expect(deps.notices).toEqual(['session']);
+    expect(autoAnswers()).toHaveLength(1);
   });
 });

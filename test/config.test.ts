@@ -311,6 +311,15 @@ describe('settings migration', () => {
     await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoRefreshPlugins: false } });
     expect((await loadConfig()).ui.autoRefreshPlugins).toBe(false);
   });
+  it('answers ChatGPT approval cards for its own connectors on every install, including older configs, unless switched off', async () => {
+    // 2026-10-29: ChatGPT asked again in every new chat, so unattended runs stalled on the card.
+    expect(defaultConfig().ui.autoAllowApproval).toBe(true);
+    const legacy = defaultConfig(); delete legacy.ui.autoAllowApproval;
+    await saveConfig(legacy);
+    expect((await loadConfig()).ui.autoAllowApproval).toBe(true);
+    await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoAllowApproval: false } });
+    expect((await loadConfig()).ui.autoAllowApproval).toBe(false);
+  });
   it('defaults automatic Skill selection off for fresh and legacy settings while preserving explicit opt-in', async () => {
     expect(defaultConfig().ui.autoSelectSkills).toBe(false);
     const legacy = defaultConfig(); delete legacy.ui.autoSelectSkills;
@@ -775,6 +784,7 @@ describe('shipped defaults', () => {
     expect(loaded.capabilities.control).toBe(false);
     expect(loaded.multiAgent.enabled).toBe(false);
     expect(loaded.ui.autoRefreshPlugins).toBe(false);
+    expect(loaded.ui.autoAllowApproval).toBe(false);
   });
 
   it('says a recovered config started read-only until read-only is switched off', async () => {

@@ -281,6 +281,7 @@ const settingsPatch = z.object({
     browserOnly: z.boolean().optional(),
     autoRefreshPlugins: z.boolean().optional(),
     autoRefreshPluginsAsked: z.boolean().optional(),
+    autoAllowApproval: z.boolean().optional(),
     autoSelectSkills: z.boolean().optional(),
     tabsToKeepOpen: z.number().int().min(1).max(50).optional(),
     minimizeToTray: z.boolean(),
@@ -507,6 +508,7 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
       autoRefreshPlugins: pick(current.ui.autoRefreshPlugins, base.ui.autoRefreshPlugins, wanted.ui.autoRefreshPlugins),
       // Only the offer's own call answers it; a settings save never takes it back.
       autoRefreshPluginsAsked: current.ui.autoRefreshPluginsAsked === true || wanted.ui.autoRefreshPluginsAsked === true,
+      autoAllowApproval: pick(current.ui.autoAllowApproval, base.ui.autoAllowApproval, wanted.ui.autoAllowApproval),
       autoSelectSkills: pick(current.ui.autoSelectSkills, base.ui.autoSelectSkills, wanted.ui.autoSelectSkills),
       tabsToKeepOpen: pick(current.ui.tabsToKeepOpen, base.ui.tabsToKeepOpen, wanted.ui.tabsToKeepOpen),
       minimizeToTray: pick(current.ui.minimizeToTray, base.ui.minimizeToTray, wanted.ui.minimizeToTray),

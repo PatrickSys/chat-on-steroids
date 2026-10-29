@@ -9,17 +9,27 @@
  * The page reports the card on every activity poll. While it stands, this module says so once
  * in the chat's timeline, sends one desktop notice after a short grace (a person already looking
  * at the card answers it first), and holds recovery: a reload or a Continue cannot answer the
- * card and could lose it. The app never answers the card itself; that consent is the user's.
+ * card and could lose it. The app answers the card itself only in the one case `answerOwnCard` names
+ * (2026-10-29); every other card is the user's to answer.
  *
  * Since 2.1.38 the person can answer it in the app (the maintainer's request, 2026-10-14): the page
  * reports the card's words, an id for that exact card and whether ChatGPT lets Allow once be pressed.
  * A click in the app files one answer for that card id, which the same page's next poll carries
  * back; the page presses the button only if the card it shows is still that card. A replaced card,
  * a second click or an answer nobody took within `APPROVAL_ANSWER_MS` sends nothing.
+ *
+ * 2026-10-29: ChatGPT asks the card again in every new chat and after every page reload, although
+ * Always allow was chosen, and a Pro run waited half an hour for a click. With `ui.autoAllowApproval`
+ * (on unless switched off) a card that names one of this app's own connectors is answered Allow once
+ * through the same path as a person's click.
  */
 import { randomUUID } from 'node:crypto';
 import { APPROVAL_ANSWERED_TEXT, APPROVAL_PROGRESS_PREFIX, APPROVAL_WAITING_TEXT, type ApprovalCardView } from '../shared/approval-wait.js';
 
+/** After this many automatic answers in one episode the app stops: a card that keeps coming back needs a person. */
+export const AUTO_ANSWERS_PER_EPISODE = 4;
+/** After a person's Deny in the app the app does not answer that chat's cards by itself for this long. */
+export const AUTO_PAUSE_AFTER_DENY_MS = 10 * 60_000;
 /** Hidden idle tabs poll every 30 s; two missed polls end the episode. */
 export const APPROVAL_FRESH_MS = 75_000;
 /** Time for a person looking at the card to answer it before a desktop notice interrupts them. */
@@ -39,6 +49,11 @@ export type ApprovalOutcome = 'clicked' | 'card_changed' | 'unavailable' | 'expi
 interface ApprovalAnswer { token: string; cardId: string; choice: ApprovalChoice; at: number; outcome: ApprovalOutcome | null }
 
 export interface ApprovalWaitDeps {
+  /**
+   * This app's own connector names while the owner lets it answer their cards; none (absent or
+   * empty) leaves every card to a person. Read at each card, so the setting takes effect at once.
+   */
+  ownConnectors?(): readonly string[];
   record(sessionId: string, progressId: string, text: string, anchor?: { seq: number; time: number }): Promise<{ seq: number; time: number } | null>;
   notify(sessionId: string): void;
   log(message: string): void;
@@ -55,6 +70,10 @@ interface Wait {
   since: number;
   seenAt: number;
   noticed: boolean;
+  /** The app filed Allow once for the card now showing; the row and the notice wait until that has failed for a while. */
+  auto: boolean;
+  /** Allow once answers filed in this episode, counting a redrawn card as the same one. */
+  presses: number;
   progressId: string;
   sessionId: string | null;
   row: Promise<{ seq: number; time: number } | null> | null;
@@ -67,10 +86,53 @@ interface Wait {
 const waits = new Map<string, Wait>();
 /** The episode a page last reported answered, kept for `APPROVAL_GONE_MS` in case the card was only redrawn. */
 const answered = new Map<string, { wait: Wait; at: number; anchor: { seq: number; time: number } | null }>();
+/** When a person last pressed Deny in the app, per chat. A Deny pressed in the browser itself is not seen. */
+const denied = new Map<string, number>();
 
 function sameWords(a: ApprovalCardFacts | null, b: ApprovalCardFacts | null | undefined): boolean {
   if (!a || !b) return !a && !b;
   return a.lines.length === b.lines.length && a.lines.every((line, index) => line === b.lines[index]);
+}
+
+/** Question marks that end a card title: Latin, full-width and Arabic. */
+const QUESTION_END = /[?\uFF1F\u061F]$/u;
+
+/**
+ * What may follow the name before the question mark: lowercase letters, other scripts' letters and marks
+ * (German "zu verwenden", Turkish, Japanese and Korean particles), spaces and parentheses. A capital, digit,
+ * symbol, emoji or punctuation there means a longer or different name ("Core 2", "Core Laptop", "Core @lap").
+ * Known gaps: a lowercase Latin word or a CJK suffix after the name still reads as part of the sentence.
+ */
+const PLAIN_AFTER = /^[\s\p{Ll}\p{Lo}\p{M}()\uFF08\uFF09]{0,60}$/u;
+/** A bracket right after the name that opens Latin text is a suffix ("Core (Laptop)"); Korean "을(를)" is not. */
+const SUFFIX_OPENING = /^\s*[([{<\uFF08\uFF3B\uFF5B\u3008-\u3010]\s*[\p{Script=Latin}\p{N}]/u;
+/** A quote that closes right after the name belongs to the sentence ("「Chat On Steroids Core」の..."). */
+const CLOSING_QUOTE = /^["\u00BB\u2019\u201D\u300D\u300F]/u;
+
+function titleNames(title: string, name: string): boolean {
+  for (let at = title.indexOf(name); at >= 0; at = title.indexOf(name, at + 1)) {
+    // The name runs on from a longer word or name before it ("My-Chat On Steroids Core").
+    if (/[\p{Script=Latin}\p{N}_-]$/u.test(title.slice(0, at))) continue;
+    const after = title.slice(at + name.length, -1).replace(CLOSING_QUOTE, '');
+    if (/^[\p{Script=Latin}\p{N}_]/u.test(after) || SUFFIX_OPENING.test(after) || !PLAIN_AFTER.test(after)) continue;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Which of `names` the card asks about, or null. Only the card's title counts: the first line when it
+ * ends in a question mark, or the second when the first is exactly one of the names (the app's header).
+ * Any other first line (a warning, another app's name) leaves the card to a person, as does a title
+ * that does not end in a question mark. The name must stand alone in the title (see `PLAIN_AFTER`), so
+ * "Chat On Steroids Core (Laptop)", "... — LAP-PACO2" and "... 2" never match. A word in front of the
+ * name ("My Chat On Steroids Core") is not told apart.
+ */
+export function cardNamedConnector(lines: readonly string[], names: readonly string[]): string | null {
+  const [first = '', second = ''] = lines;
+  const title = QUESTION_END.test(first) ? first : names.includes(first) ? second : '';
+  if (!title || !QUESTION_END.test(title) || title.length > 140) return null;
+  return names.find(name => !!name && titleNames(title, name)) ?? null;
 }
 
 /** Whether this chat's page said, recently enough to still be true, that the card is waiting. */
@@ -125,7 +187,7 @@ export async function noteApprovalCard(
     if (before.anchor && wait.sessionId) await deps.record(wait.sessionId, wait.progressId, APPROVAL_WAITING_TEXT, before.anchor).catch(() => null);
   }
   if (!wait) {
-    wait = { since: now, seenAt: now, noticed: false, progressId: `${APPROVAL_PROGRESS_PREFIX}${conversationId}:${now}`, sessionId: null, row: null, card: null, answer: null, stale: null };
+    wait = { since: now, seenAt: now, noticed: false, auto: false, presses: 0, progressId: `${APPROVAL_PROGRESS_PREFIX}${conversationId}:${now}`, sessionId: null, row: null, card: null, answer: null, stale: null };
     waits.set(conversationId, wait);
     deps.log(`bridge: ${conversationId} waits for the user to answer ChatGPT's tool approval card`);
     try { deps.changed?.(); } catch { /* The list is reread on the next push. */ }
@@ -151,10 +213,14 @@ export async function noteApprovalCard(
   }
   if (card) {
     // Another card replaces this one: an answer filed for the old card must never reach it.
-    if (wait.card && wait.card.id !== card.id) wait.answer = null;
+    // Another card, or other words in the same element, is a new request: an answer filed for the old one never reaches it.
+    const fresh = wait.card?.id !== card.id || !sameWords(wait.card, card);
+    if (wait.card && fresh) { wait.answer = null; wait.auto = false; }
     wait.card = card;
+    if (fresh) answerOwnCard(conversationId, wait, card, deps, now);
   }
-  if (sessionId && !wait.sessionId) {
+  // A card the app answered itself gets no row and no notice unless it is still standing after the grace: the answer is on its way.
+  if (sessionId && !wait.sessionId && !(wait.auto && now - wait.since < APPROVAL_NOTICE_GRACE_MS)) {
     wait.sessionId = sessionId;
     const current = wait;
     const own = `${APPROVAL_PROGRESS_PREFIX}${conversationId}:`;
@@ -172,6 +238,42 @@ export async function noteApprovalCard(
   if (wait.sessionId && !wait.noticed && now - wait.since >= APPROVAL_NOTICE_GRACE_MS) {
     wait.noticed = true;
     try { deps.notify(wait.sessionId); } catch { /* The row still says it. */ }
+  }
+}
+
+/**
+ * A card that names one of this app's own connectors is answered Allow once through the same path
+ * as a person's click: one answer for exactly this card, carried by the same page, refused if ChatGPT
+ * disabled Allow. One attempt per card: if the press fails the card stays for a person, with the row
+ * and the notice after the grace. Always allow is never pressed. The answer does not look at what the
+ * card is about, so a card ChatGPT's safety check raised (a "Suspicious instruction") with a plain
+ * title is answered too; each answer is logged with the card's first two lines to show what it was.
+ */
+function answerOwnCard(conversationId: string, wait: Wait, card: ApprovalCardFacts, deps: ApprovalWaitDeps, now: number): void {
+  try {
+    const names = deps.ownConnectors?.() ?? [];
+    if (!names.length || !card.allow) return;
+    const name = cardNamedConnector(card.lines, names);
+    if (!name) return;
+    const deniedAt = denied.get(conversationId);
+    if (deniedAt !== undefined && now - deniedAt < AUTO_PAUSE_AFTER_DENY_MS) {
+      deps.log(`bridge: ${conversationId} tool approval card for ${name} left to a person: they pressed Deny in the app a moment ago`);
+      return;
+    }
+    if (wait.presses >= AUTO_ANSWERS_PER_EPISODE) {
+      deps.log(`bridge: ${conversationId} tool approval card for ${name} left to a person: it came back ${wait.presses} times in a row`);
+      return;
+    }
+    const asked = requestApprovalAnswer(conversationId, card.id, 'allow', now);
+    wait.auto = asked.ok;
+    if (asked.ok) wait.presses++;
+    const seen = card.lines.slice(0, 2).map(line => line.slice(0, 120)).join(' | ');
+    deps.log(asked.ok
+      ? `bridge: ${conversationId} tool approval card for ${name} auto-allowed (Allow once): ${seen}`
+      : `bridge: ${conversationId} tool approval card for ${name} not auto-allowed: ${asked.error}`);
+  } catch (error) {
+    // A fault here must not stop the wait from being noted: that is the stall this exists to end.
+    try { deps.log(`bridge: ${conversationId} tool approval card could not be answered automatically: ${error instanceof Error ? error.message : String(error)}`); } catch { /* nothing left to tell */ }
   }
 }
 
@@ -194,6 +296,7 @@ export function requestApprovalAnswer(conversationId: string, cardId: string, ch
   expire(wait, now);
   if (wait.answer && wait.answer.outcome === null) return { ok: false, error: 'answer_pending' };
   wait.answer = { token: randomUUID(), cardId, choice, at: now, outcome: null };
+  if (choice === 'deny') denied.set(conversationId, now);
   return { ok: true, token: wait.answer.token };
 }
 
@@ -245,4 +348,5 @@ export function resetApprovalWaits(): void {
   for (const wait of waits.values()) if (wait.stale) clearTimeout(wait.stale);
   waits.clear();
   answered.clear();
+  denied.clear();
 }

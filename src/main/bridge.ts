@@ -5,8 +5,8 @@ import { conversationProgress } from './session/progress.js';
 import { cosSignInTransfer, SignInTransferError } from './cos-browser/sign-in-transfer.js';
 import { externalBrowserProof, noteExternalInstalled, noteExternalSignedIn, resetBrowserProofForTests } from './browser-proof.js';
 import { notePluginInstalled, notePluginMissing } from './connector-proof.js';
-import { connectorNames } from '../shared/connector-names.js';
-import { connectorApps, conversationCreatedAt, noteAppSightings, type AppSighting } from './connector-identity.js';
+import { CONNECTOR_BRAND, connectorNames } from '../shared/connector-names.js';
+import { connectorApps, conversationCreatedAt, learnedConnectorName, noteAppSightings, type AppSighting } from './connector-identity.js';
 import { messageReaction } from '../shared/message-reaction.js';
 import { browserControl } from './browser-control.js';
 import type { BrowserResult } from '../shared/browser-control.js';
@@ -7295,6 +7295,11 @@ const lastAttributedCallAt = new Map<string, number>();
 export const GOAL_QUIET_MS = 60_000;
 
 const approvalWaitDeps: ApprovalWaitDeps = {
+  // The names this install's connectors carry in ChatGPT: configured, and as ChatGPT was seen to call them
+  // (a rename that dropped the brand is left to a person; a short name would match other apps' cards).
+  ownConnectors: () => getConfig().ui.autoAllowApproval === false ? [] : [...new Set(
+    (['core', 'desktop', 'plugins'] as const).flatMap(surface => [connectorNames(getConfig().connectorSuffix)[surface], learnedConnectorName(surface)])
+      .filter((name): name is string => !!name?.includes(CONNECTOR_BRAND)))],
   record: (sessionId, progressId, text, anchor) => recordProgress(sessionId, progressId, text, anchor),
   notify: noticeApprovalWaiting,
   log: logInfo,

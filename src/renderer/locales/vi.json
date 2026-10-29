@@ -3399,5 +3399,7 @@
   "Commit from Review": "Commit từ Xem lại",
   "Commit the chosen files, then push and open a pull request.": "Commit các tệp đã chọn, rồi push và mở pull request.",
   "Your own chat style": "Phong cách trò chuyện của bạn",
-  "Rewrite how ChatGPT talks and writes in new chats.": "Viết lại cách ChatGPT nói và viết trong các cuộc trò chuyện mới."
+  "Rewrite how ChatGPT talks and writes in new chats.": "Viết lại cách ChatGPT nói và viết trong các cuộc trò chuyện mới.",
+  "Answer tool approvals automatically": "Tự động trả lời yêu cầu phê duyệt công cụ",
+  "ChatGPT asks \"Allow ChatGPT to use Chat On Steroids …?\" again in every new chat and after a page reload, even after you chose Always allow. When on, the app presses Allow once on cards that name Chat On Steroids, so a run never waits for you, and logs each answer. This includes cards ChatGPT's safety check raised: a web page or file that steers the model can then run commands without you looking. Turn it off to approve each card yourself.": "ChatGPT hỏi lại \"Cho phép ChatGPT sử dụng Chat On Steroids …?\" ở mỗi cuộc trò chuyện mới và sau khi tải lại trang, ngay cả khi bạn đã chọn Luôn cho phép. Khi bật, ứng dụng nhấn Cho phép một lần trên các thẻ nhắc đến Chat On Steroids để lượt chạy không bao giờ phải chờ bạn, và ghi lại mọi câu trả lời. Điều này gồm cả các thẻ do kiểm tra an toàn của ChatGPT đưa ra: một trang web hoặc tệp điều khiển mô hình có thể chạy lệnh mà bạn không hay biết. Hãy tắt để tự phê duyệt từng thẻ."
 }

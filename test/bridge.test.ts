@@ -9572,14 +9572,14 @@ describe('unattributed activity recovery', () => {
     } finally { clock.mockRestore(); }
   });
 
-  it('explains a refused stalled-tab reload once a minute, not once a pass', async () => {
+  it('explains a refused stalled-tab reload once per tab per hour, even when the cause changes', async () => {
     vi.useFakeTimers();
     try {
       await pair();
       await attributed(PRIME);
       await vi.advanceTimersByTimeAsync(60 * 60_000);
-      const stalled = () => request('POST', '/status', {
-        body: { openConversations: [PRIME], stalledConversations: [PRIME] }
+      const stalled = (conversationId = PRIME) => request('POST', '/status', {
+        body: { openConversations: [conversationId], stalledConversations: [conversationId] }
       });
       const lines = () => getLog().filter(entry => entry.message.includes('is a stalled browser tab — not reloaded'));
       await stalled();
@@ -9592,11 +9592,43 @@ describe('unattributed activity recovery', () => {
       expect(lines()).toHaveLength(first);
       await vi.advanceTimersByTimeAsync(20_000);
       await stalled();
+      expect(lines()).toHaveLength(first);
+      await saveConfig({ ...getConfig(), multiAgent: { ...getConfig().multiAgent, recoverAgentTabs: false } });
+      await stalled();
+      expect(lines()).toHaveLength(first);
+      await attributed(OTHER);
+      await stalled(OTHER);
       expect(lines()).toHaveLength(first + 1);
+      await vi.advanceTimersByTimeAsync(59 * 60_000 - 1);
+      await stalled();
+      expect(lines()).toHaveLength(first + 1);
+      await vi.advanceTimersByTimeAsync(1);
+      await stalled();
+      expect(lines()).toHaveLength(first + 2);
       // Clock rollback must not silence the refusal until wall time catches up.
       vi.setSystemTime(Date.now() - 120_000);
       await stalled();
-      expect(lines()).toHaveLength(first + 2);
+      expect(lines()).toHaveLength(first + 3);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('keeps the minute cadence for refused missing-tab recovery', async () => {
+    vi.useFakeTimers();
+    try {
+      await pair();
+      await attributed(PRIME);
+      await saveConfig({ ...getConfig(), multiAgent: { ...getConfig().multiAgent, recoverAgentTabs: false } });
+      const closed = () => request('POST', '/closed', { body: { conversationId: PRIME } });
+      const lines = () => getLog().filter(entry => entry.message.includes('closed its last tab — not reopened'));
+      await closed();
+      const first = lines().length;
+      expect(first).toBeGreaterThan(0);
+      await vi.advanceTimersByTimeAsync(59_999);
+      await closed();
+      expect(lines()).toHaveLength(first);
+      await vi.advanceTimersByTimeAsync(1);
+      await closed();
+      expect(lines()).toHaveLength(first + 1);
     } finally { vi.useRealTimers(); }
   });
 

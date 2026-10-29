@@ -8923,10 +8923,10 @@ function noteFiberHealth(conversationId: string, raw: string | null, now = Date.
 const REFUSAL_NOTICE_EVERY_MS = 60_000;
 const refusalNoticedAt = new Map<string, number>();
 
-function noticeRefusal(key: string, message: string): void {
+function noticeRefusal(key: string, message: string, intervalMs = REFUSAL_NOTICE_EVERY_MS): void {
   const now = Date.now();
   const last = refusalNoticedAt.get(key);
-  if (last !== undefined && now >= last && now - last < REFUSAL_NOTICE_EVERY_MS) return;
+  if (last !== undefined && now >= last && now - last < intervalMs) return;
   refusalNoticedAt.set(key, now);
   if (refusalNoticedAt.size > 500) {
     for (const old of [...refusalNoticedAt.keys()].slice(0, 100)) refusalNoticedAt.delete(old);
@@ -9804,7 +9804,7 @@ async function queueStalledTabRecovery(conversationId: string, now = Date.now())
   const session = await findSessionByConversation(conversationId, { requireUnique: true });
   const name = agent ? `${agent.id} (${conversationId})` : conversationId;
   const declined = (why: string): void => {
-    noticeRefusal(`stalled:${conversationId}:${why}`, `bridge: ${name} is a stalled browser tab — not reloaded: ${why}`);
+    noticeRefusal(`stalled:${conversationId}`, `bridge: ${name} is a stalled browser tab — not reloaded: ${why}`, 60 * 60_000);
   };
   // A chat with no session is not this app's chat; its tab sleeping is nobody's business here.
   if (!session) return;

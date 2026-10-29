@@ -396,6 +396,7 @@ const configSchema = z.object({
     browserOnly: z.boolean().optional().default(false),
     autoRefreshPlugins: z.boolean().optional().default(false),
     autoRefreshPluginsAsked: z.boolean().optional().default(false),
+    autoAllowApproval: z.boolean().optional().default(true),
     autoSelectSkills: z.boolean().optional().default(false),
     tabsToKeepOpen: z.number().int().min(1).max(50).optional(),
     minimizeToTray: z.boolean(),
@@ -661,7 +662,7 @@ export function defaultConfig(platform: NodeJS.Platform = process.platform, rele
     // Fresh installs refresh changed connector tools on their own: a permission chosen in Setup
     // changes the tool list, and nothing else tells a new user to refresh the plugin in ChatGPT.
     // Older configs keep the schema default (off).
-    ui: { minimizeToTray: true, autoConnect: false, startAtLogin: false, keepAwake: true, keepScreenAwake: false, cosBrowserMinimize: 'taskbar', turnNotifications: true, sounds: false, rotateTurnMinutes: 30, rotateStopFallback: false, localAppUsage: true, privacyScreenshots: false, secretsShield: true, theme: 'dark', autoRefreshPlugins: true, autoSelectSkills: false, backgroundChats: true, backgroundPlacement: 'window', followUp: 'steer', enterSends: true, browserBridgePort: 'auto', autoContinue: true, followOutput: true, mentionCore: true, mentionPlugins: false,
+    ui: { minimizeToTray: true, autoConnect: false, startAtLogin: false, keepAwake: true, keepScreenAwake: false, cosBrowserMinimize: 'taskbar', turnNotifications: true, sounds: false, rotateTurnMinutes: 30, rotateStopFallback: false, localAppUsage: true, privacyScreenshots: false, secretsShield: true, theme: 'dark', autoAllowApproval: true, autoRefreshPlugins: true, autoSelectSkills: false, backgroundChats: true, backgroundPlacement: 'window', followUp: 'steer', enterSends: true, browserBridgePort: 'auto', autoContinue: true, followOutput: true, mentionCore: true, mentionPlugins: false,
       // The built-in browser is opt-in: Chrome with the companion stays the default for new and
       // existing installs alike, and the built-in one runs only once someone chooses it.
       chatBrowser: 'chrome' },
@@ -690,7 +691,8 @@ function conservativeRecoveryConfig(): Config {
     readOnly: true,
     multiAgent: { ...DEFAULT_MULTI_AGENT },
     // Damage is not a choice of browser either: keep the one every older config reads as.
-    ui: { ...defaultConfig().ui, autoContinue: false, autoRefreshPlugins: false, chatBrowser: 'chrome' },
+    // An unreadable file is no consent to answer ChatGPT's approval cards either.
+    ui: { ...defaultConfig().ui, autoContinue: false, autoRefreshPlugins: false, autoAllowApproval: false, chatBrowser: 'chrome' },
     // A config file that could not be trusted is not consent to have a second model typing
     // into the user's chat, whatever the unreadable file said.
     goal: { ...DEFAULT_GOAL }

@@ -163,6 +163,12 @@ export interface UiPrefs {
   autoRefreshPlugins?: boolean;
   /** True once the person answered the one-time offer to turn automatic plugin refresh on. */
   autoRefreshPluginsAsked?: boolean;
+  /**
+   * Answer ChatGPT's tool approval card with Allow once when it names one of this app's own connectors.
+   * On unless switched off: ChatGPT asks again in every new chat and after a page reload, and a run
+   * that waits for a person to click stalls (2026-10-29). Absent reads as on.
+   */
+  autoAllowApproval?: boolean;
   /** Opt-in deterministic metadata routing for managed Skills on ordinary user input. */
   autoSelectSkills?: boolean;
   /** Actual app-owned tabs to retain; active work and drafts stay protected. Omitted uses workers + 2. */

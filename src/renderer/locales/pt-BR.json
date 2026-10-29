@@ -3533,5 +3533,7 @@
   "Commit from Review": "Commit pela Revisão",
   "Commit the chosen files, then push and open a pull request.": "Faça commit dos arquivos escolhidos, depois push e abra um pull request.",
   "Your own chat style": "Seu próprio estilo de chat",
-  "Rewrite how ChatGPT talks and writes in new chats.": "Reescreva como o ChatGPT fala e escreve nos chats novos."
+  "Rewrite how ChatGPT talks and writes in new chats.": "Reescreva como o ChatGPT fala e escreve nos chats novos.",
+  "Answer tool approvals automatically": "Responder automaticamente às aprovações de ferramentas",
+  "ChatGPT asks \"Allow ChatGPT to use Chat On Steroids …?\" again in every new chat and after a page reload, even after you chose Always allow. When on, the app presses Allow once on cards that name Chat On Steroids, so a run never waits for you, and logs each answer. It never answers a card ChatGPT's safety check raised (\"Suspicious instruction\") or one it does not recognize; those wait for you. Turn it off to approve each card yourself.": "O ChatGPT pergunta de novo \"Permitir que o ChatGPT use Chat On Steroids …?\" em cada novo chat e após recarregar a página, mesmo que você tenha escolhido Permitir sempre. Quando ativado, o app pressiona Permitir uma vez nos cartões que citam Chat On Steroids, para que uma execução nunca fique esperando por você, e registra cada resposta. Nunca responde a um cartão gerado pela verificação de segurança do ChatGPT (\"Instrução suspeita\") nem a um que não reconhece; esses esperam por você. Desative para aprovar cada cartão você mesmo."
 }

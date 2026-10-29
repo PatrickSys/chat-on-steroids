@@ -3399,5 +3399,7 @@
   "Commit from Review": "レビューからコミット",
   "Commit the chosen files, then push and open a pull request.": "選んだファイルをコミットし、プッシュしてプルリクエストを開けます。",
   "Your own chat style": "自分のチャットスタイル",
-  "Rewrite how ChatGPT talks and writes in new chats.": "新しいチャットで ChatGPT がどう話し、どう書くかを書き換えられます。"
+  "Rewrite how ChatGPT talks and writes in new chats.": "新しいチャットで ChatGPT がどう話し、どう書くかを書き換えられます。",
+  "Answer tool approvals automatically": "ツールの承認に自動で応答する",
+  "ChatGPT asks \"Allow ChatGPT to use Chat On Steroids …?\" again in every new chat and after a page reload, even after you chose Always allow. When on, the app presses Allow once on cards that name Chat On Steroids, so a run never waits for you, and logs each answer. It never answers a card ChatGPT's safety check raised (\"Suspicious instruction\") or one it does not recognize; those wait for you. Turn it off to approve each card yourself.": "ChatGPT は「ChatGPT による Chat On Steroids … の使用を許可しますか？」を、「常に許可」を選んだ後でも、新しいチャットごと、またページの再読み込み後に再度尋ねます。オンにすると、アプリは Chat On Steroids の名前が出るカードで「今回のみ許可」を押し、実行があなたを待たないようにして、すべての応答を記録します。ChatGPT の安全性チェックが出したカード（「不審な指示」）や、認識できないカードには決して応答せず、あなたの確認を待ちます。各カードを自分で承認するにはオフにしてください。"
 }

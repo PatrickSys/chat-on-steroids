@@ -4796,6 +4796,35 @@ describe('extension observation journal', () => {
     ]);
   });
 
+  it('forwards the approval card\'s words and its re-check, cut and data-start facts, and nothing else, to the app that reads them', async () => {
+    // Three files carry this: the page reports it, the worker reshapes it, the app's parser reads it. The app answers a
+    // card by itself only when the page says it re-checks the card, so a lost field would stall every card quietly.
+    const { parseApprovalCard } = await import('../src/main/approval-wait.js');
+    const conversationId = '22222222-3333-4444-5555-666666666666';
+    const seen: Array<string | null> = [];
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/activity') {
+        seen.push(url.searchParams.get('approvalCard'));
+        return response(200, { sessionId: 'session', entries: [], stream: [], nextSince: 0 });
+      }
+      return response(404, {});
+    });
+    const worker = loadWorker({ local: new FakeStorageArea({ port: 8765, token: 'paired-token' }), session: new FakeStorageArea(), fetch });
+    const id = '0f9d6a52-6a3c-4d54-9d54-0d4c1f0f1a11';
+    const lines = ['Allow ChatGPT to use Chat On Steroids Core?', 'The shared data includes:', 'Command: ls'];
+    await worker.send({ type: 'activity', conversationId, since: 0, approval: true, approvalCard: { id, lines, allow: true, recheck: true, cut: false, data: 2, extra: ['Deny', 'Allow once', 7, 'x'.repeat(300)], stray: 'dropped' } }, 73);
+    await worker.send({ type: 'activity', conversationId, since: 0, approval: true, approvalCard: { id, lines, allow: true, recheck: 'yes', cut: 1, data: 9, extra: 'Warning' } }, 73);
+    await worker.send({ type: 'activity', conversationId, since: 0, approval: true, approvalCard: { id, lines, allow: true } }, 73);
+    const parsed = seen.map(raw => parseApprovalCard(raw));
+    expect(parsed[0]).toEqual({ id, lines, allow: true, recheck: true, cut: false, data: 2, extra: ['Deny', 'Allow once', 'x'.repeat(100)] });
+    expect(seen[0]).not.toContain('dropped');
+    // Only a real `true` is a re-check, and a data index outside the lines is no index; a page that says nothing is an old page.
+    expect(parsed[1]).toEqual({ id, lines, allow: true, recheck: false, cut: false, extra: [] });
+    expect(parsed[2]).toEqual({ id, lines, allow: true, recheck: false, cut: false, extra: [] });
+  });
+
   it('forwards the page-model helper health, and only the words the page may say', async () => {
     // This field crosses three files, and that join is where two checkpoint fields have already
     // been lost with every unit test still green — see scripts/verify-compact-chain.mjs. The

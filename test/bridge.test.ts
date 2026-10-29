@@ -9572,14 +9572,14 @@ describe('unattributed activity recovery', () => {
     } finally { clock.mockRestore(); }
   });
 
-  it('explains a refused stalled-tab reload once a minute, not once a pass', async () => {
+  it('explains a refused stalled-tab reload once per tab per hour, even when the cause changes', async () => {
     vi.useFakeTimers();
     try {
       await pair();
       await attributed(PRIME);
       await vi.advanceTimersByTimeAsync(60 * 60_000);
-      const stalled = () => request('POST', '/status', {
-        body: { openConversations: [PRIME], stalledConversations: [PRIME] }
+      const stalled = (conversationId = PRIME) => request('POST', '/status', {
+        body: { openConversations: [conversationId], stalledConversations: [conversationId] }
       });
       const lines = () => getLog().filter(entry => entry.message.includes('is a stalled browser tab — not reloaded'));
       await stalled();
@@ -9592,11 +9592,43 @@ describe('unattributed activity recovery', () => {
       expect(lines()).toHaveLength(first);
       await vi.advanceTimersByTimeAsync(20_000);
       await stalled();
+      expect(lines()).toHaveLength(first);
+      await saveConfig({ ...getConfig(), multiAgent: { ...getConfig().multiAgent, recoverAgentTabs: false } });
+      await stalled();
+      expect(lines()).toHaveLength(first);
+      await attributed(OTHER);
+      await stalled(OTHER);
       expect(lines()).toHaveLength(first + 1);
+      await vi.advanceTimersByTimeAsync(59 * 60_000 - 1);
+      await stalled();
+      expect(lines()).toHaveLength(first + 1);
+      await vi.advanceTimersByTimeAsync(1);
+      await stalled();
+      expect(lines()).toHaveLength(first + 2);
       // Clock rollback must not silence the refusal until wall time catches up.
       vi.setSystemTime(Date.now() - 120_000);
       await stalled();
-      expect(lines()).toHaveLength(first + 2);
+      expect(lines()).toHaveLength(first + 3);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('keeps the minute cadence for refused missing-tab recovery', async () => {
+    vi.useFakeTimers();
+    try {
+      await pair();
+      await attributed(PRIME);
+      await saveConfig({ ...getConfig(), multiAgent: { ...getConfig().multiAgent, recoverAgentTabs: false } });
+      const closed = () => request('POST', '/closed', { body: { conversationId: PRIME } });
+      const lines = () => getLog().filter(entry => entry.message.includes('closed its last tab — not reopened'));
+      await closed();
+      const first = lines().length;
+      expect(first).toBeGreaterThan(0);
+      await vi.advanceTimersByTimeAsync(59_999);
+      await closed();
+      expect(lines()).toHaveLength(first);
+      await vi.advanceTimersByTimeAsync(1);
+      await closed();
+      expect(lines()).toHaveLength(first + 1);
     } finally { vi.useRealTimers(); }
   });
 
@@ -9775,6 +9807,34 @@ describe('unattributed activity recovery', () => {
       } finally { vi.useRealTimers(); }
     }
   );
+
+  // 2026-10-29: ChatGPT asks again in every new chat; a Pro run waited 30+ minutes for a click.
+  it('answers a card for its own connector in the same poll, once, and never another app\'s or while switched off', async () => {
+    const { resetApprovalWaits } = await import('../src/main/approval-wait.js');
+    resetApprovalWaits();
+    await pair();
+    const poll = async (id: string, title: string, allow = true, recheck = true) => (await request('GET', `/activity?conversationId=${PRIME}&approval=1&approvalCard=${
+      encodeURIComponent(JSON.stringify({ id, lines: [title, 'The shared data includes:', 'Command: ls'], data: 2, allow, recheck }))}`)).body.approvalAnswer;
+    const core = 'Allow ChatGPT to use Chat On Steroids Core?';
+    expect(await poll('approval-card-gmail', 'Allow ChatGPT to use Gmail?')).toBeUndefined();
+    expect(await poll('approval-card-disabled', core, false)).toBeUndefined();
+    // A page that does not re-read the card's words before pressing (an older extension) is not asked to press by itself.
+    expect(await poll('approval-card-old-page', core, true, false)).toBeUndefined();
+    const own = await poll('approval-card-own-1', core);
+    expect(own).toMatchObject({ cardId: 'approval-card-own-1', choice: 'allow' });
+    // The same card on the next poll is not answered a second time; the page reports the press instead.
+    const token = own.token;
+    expect(await poll('approval-card-own-1', core)).toMatchObject({ token });
+    await request('GET', `/activity?conversationId=${PRIME}&approval=1&approvalCard=${encodeURIComponent(JSON.stringify({ id: 'approval-card-own-1', lines: [core, 'The shared data includes:', 'Command: ls'], data: 2, allow: true, recheck: true }))}&approvalResult=${encodeURIComponent(JSON.stringify({ token, outcome: 'clicked' }))}`);
+    expect(await poll('approval-card-own-1', core)).toBeUndefined();
+    await saveConfig({ ...getConfig(), ui: { ...getConfig().ui, autoAllowApproval: false } });
+    try {
+      expect(await poll('approval-card-own-2', core)).toBeUndefined();
+    } finally {
+      await saveConfig({ ...getConfig(), ui: { ...getConfig().ui, autoAllowApproval: true } });
+      resetApprovalWaits();
+    }
+  });
 
   it('holds an already queued unattributed repair without losing its later handout', async () => {
     vi.useFakeTimers();

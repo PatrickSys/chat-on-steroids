@@ -9,17 +9,32 @@
  * The page reports the card on every activity poll. While it stands, this module says so once
  * in the chat's timeline, sends one desktop notice after a short grace (a person already looking
  * at the card answers it first), and holds recovery: a reload or a Continue cannot answer the
- * card and could lose it. The app never answers the card itself; that consent is the user's.
+ * card and could lose it. The app answers the card itself only in the one case `handleFreshCard` names
+ * (2026-10-29); every other card is the user's to answer.
  *
  * Since 2.1.38 the person can answer it in the app (the maintainer's request, 2026-10-14): the page
  * reports the card's words, an id for that exact card and whether ChatGPT lets Allow once be pressed.
  * A click in the app files one answer for that card id, which the same page's next poll carries
- * back; the page presses the button only if the card it shows is still that card. A replaced card,
- * a second click or an answer nobody took within `APPROVAL_ANSWER_MS` sends nothing.
+ * back; the page presses the button only if the card it shows is still that card, with the same words
+ * (the answer carries them; a page re-reads them immediately before pressing). A replaced or reworded
+ * card, a second click or an answer nobody took within `APPROVAL_ANSWER_MS` sends nothing.
+ *
+ * 2026-10-29: ChatGPT asks the card again in every new chat and after every page reload, although
+ * Always allow was chosen, and a Pro run waited half an hour for a click. With `ui.autoAllowApproval`
+ * (on unless switched off) a plain permission request for one of this app's own connectors is answered
+ * Allow once through the same path as a person's click. A safety card ("Suspicious instruction") and any card
+ * not recognised as such a request are never answered; see `approval-card-kind.ts`.
  */
 import { randomUUID } from 'node:crypto';
+import { cardHeading, cardNamedConnector, cardShape, classifyApprovalCard, splitCard } from './approval-card-kind.js';
 import { APPROVAL_ANSWERED_TEXT, APPROVAL_PROGRESS_PREFIX, APPROVAL_WAITING_TEXT, type ApprovalCardView } from '../shared/approval-wait.js';
 
+export { cardNamedConnector };
+
+/** After this many automatic answers in one episode the app stops: a card that keeps coming back needs a person. */
+export const AUTO_ANSWERS_PER_EPISODE = 4;
+/** After a person's Deny in the app the app does not answer that chat's cards by itself for this long. */
+export const AUTO_PAUSE_AFTER_DENY_MS = 10 * 60_000;
 /** Hidden idle tabs poll every 30 s; two missed polls end the episode. */
 export const APPROVAL_FRESH_MS = 75_000;
 /** Time for a person looking at the card to answer it before a desktop notice interrupts them. */
@@ -33,12 +48,31 @@ export const APPROVAL_ANSWER_MS = 30_000;
 export const APPROVAL_GONE_MS = 4_000;
 
 /** What the page reports about the card it shows. */
-export interface ApprovalCardFacts { id: string; lines: string[]; allow: boolean }
+export interface ApprovalCardFacts {
+  id: string;
+  lines: string[];
+  allow: boolean;
+  /** Index of the first shared-data line, as the page counts it (see `approval-card-kind.ts`). */
+  data?: number;
+  /** The page left some of the card's own words out of `lines`. */
+  cut?: boolean;
+  /** Texts the page drops when it reads the words (buttons, labels, hidden parts), read for warnings. */
+  extra?: string[];
+  /** This page re-reads the card's words immediately before pressing and refuses a changed card (2026-10-29). */
+  recheck?: boolean;
+}
 export type ApprovalChoice = 'allow' | 'deny';
 export type ApprovalOutcome = 'clicked' | 'card_changed' | 'unavailable' | 'expired';
-interface ApprovalAnswer { token: string; cardId: string; choice: ApprovalChoice; at: number; outcome: ApprovalOutcome | null }
+/** The card as the answer was given for it: the page presses only a card that still reads exactly so. */
+export interface ApprovalWords { lines: string[]; data: number | null; cut: boolean; extra: string[] }
+interface ApprovalAnswer { token: string; cardId: string; choice: ApprovalChoice; words: ApprovalWords; at: number; outcome: ApprovalOutcome | null }
 
 export interface ApprovalWaitDeps {
+  /**
+   * This app's own connector names while the owner lets it answer their cards; none (absent or
+   * empty) leaves every card to a person. Read at each card, so the setting takes effect at once.
+   */
+  ownConnectors?(): readonly string[];
   record(sessionId: string, progressId: string, text: string, anchor?: { seq: number; time: number }): Promise<{ seq: number; time: number } | null>;
   notify(sessionId: string): void;
   log(message: string): void;
@@ -55,6 +89,14 @@ interface Wait {
   since: number;
   seenAt: number;
   noticed: boolean;
+  /** The app filed Allow once for the card now showing; the row and the notice wait until that has failed for a while. */
+  auto: boolean;
+  /** Allow once answers filed in this episode, counting a redrawn card as the same one. */
+  presses: number;
+  /** The words of the last card this episode told the log about as a warning, so a redrawn card is told once. */
+  flagged: string | null;
+  /** A person pressed Deny in the app during this episode: the app answers nothing more in it. */
+  refused: boolean;
   progressId: string;
   sessionId: string | null;
   row: Promise<{ seq: number; time: number } | null> | null;
@@ -67,10 +109,13 @@ interface Wait {
 const waits = new Map<string, Wait>();
 /** The episode a page last reported answered, kept for `APPROVAL_GONE_MS` in case the card was only redrawn. */
 const answered = new Map<string, { wait: Wait; at: number; anchor: { seq: number; time: number } | null }>();
+/** When a person last pressed Deny in the app, per chat. A Deny pressed in the browser itself is not seen. */
+const denied = new Map<string, number>();
 
 function sameWords(a: ApprovalCardFacts | null, b: ApprovalCardFacts | null | undefined): boolean {
   if (!a || !b) return !a && !b;
-  return a.lines.length === b.lines.length && a.lines.every((line, index) => line === b.lines[index]);
+  const same = (x: readonly string[] = [], y: readonly string[] = []): boolean => x.length === y.length && x.every((line, index) => line === y[index]);
+  return same(a.lines, b.lines) && same(a.extra, b.extra) && a.data === b.data && (a.cut === true) === (b.cut === true);
 }
 
 /** Whether this chat's page said, recently enough to still be true, that the card is waiting. */
@@ -125,7 +170,7 @@ export async function noteApprovalCard(
     if (before.anchor && wait.sessionId) await deps.record(wait.sessionId, wait.progressId, APPROVAL_WAITING_TEXT, before.anchor).catch(() => null);
   }
   if (!wait) {
-    wait = { since: now, seenAt: now, noticed: false, progressId: `${APPROVAL_PROGRESS_PREFIX}${conversationId}:${now}`, sessionId: null, row: null, card: null, answer: null, stale: null };
+    wait = { since: now, seenAt: now, noticed: false, auto: false, presses: 0, flagged: null, refused: false, progressId: `${APPROVAL_PROGRESS_PREFIX}${conversationId}:${now}`, sessionId: null, row: null, card: null, answer: null, stale: null };
     waits.set(conversationId, wait);
     deps.log(`bridge: ${conversationId} waits for the user to answer ChatGPT's tool approval card`);
     try { deps.changed?.(); } catch { /* The list is reread on the next push. */ }
@@ -151,10 +196,14 @@ export async function noteApprovalCard(
   }
   if (card) {
     // Another card replaces this one: an answer filed for the old card must never reach it.
-    if (wait.card && wait.card.id !== card.id) wait.answer = null;
+    // Another card, or other words in the same element, is a new request: an answer filed for the old one never reaches it.
+    const fresh = wait.card?.id !== card.id || !sameWords(wait.card, card);
+    if (wait.card && fresh) { wait.answer = null; wait.auto = false; }
     wait.card = card;
+    if (fresh) handleFreshCard(conversationId, wait, card, deps, now);
   }
-  if (sessionId && !wait.sessionId) {
+  // A card the app answered itself gets no row and no notice unless it is still standing after the grace: the answer is on its way.
+  if (sessionId && !wait.sessionId && !(wait.auto && now - wait.since < APPROVAL_NOTICE_GRACE_MS)) {
     wait.sessionId = sessionId;
     const current = wait;
     const own = `${APPROVAL_PROGRESS_PREFIX}${conversationId}:`;
@@ -175,12 +224,67 @@ export async function noteApprovalCard(
   }
 }
 
+/**
+ * A freshly seen card, sorted by `classifyApprovalCard`. Only a plain permission request for one of this
+ * app's own connectors is answered, Allow once, through the same path as a person's click: one answer for
+ * exactly this card, carrying the words it was judged on, which the page checks again immediately before
+ * pressing. One attempt per card: if the press fails the card stays for a person, with the row and the
+ * notice after the grace. Always allow is never pressed.
+ *
+ * A card ChatGPT's safety check raised ("Suspicious instruction"), or any card the app does not recognise
+ * as a plain permission request for its own connector, is never answered. The person is told through the
+ * usual row and notice after the grace, and the log gets one "safety card waiting" line per card with the
+ * time, the chat and the card's heading, nothing from the page beyond it, for a notifier to pick up.
+ */
+function handleFreshCard(conversationId: string, wait: Wait, card: ApprovalCardFacts, deps: ApprovalWaitDeps, now: number): void {
+  try {
+    const names = deps.ownConnectors?.() ?? [];
+    const kind = classifyApprovalCard(card, names);
+    if (kind.kind === 'safety' || (kind.kind === 'other' && kind.namesThisApp)) {
+      const words = JSON.stringify([card.lines, card.extra ?? [], card.data ?? null, card.cut === true]);
+      if (wait.flagged !== words) {
+        wait.flagged = words;
+        // The heading only, and for a card not recognised its shape in numbers: never the rest of the card.
+        deps.log(`bridge: ${conversationId} safety card waiting${kind.kind === 'safety' ? '' : ` (not recognised as a plain permission request: ${cardShape(card)})`}: ${cardHeading(card)}`);
+      }
+      return;
+    }
+    if (kind.kind !== 'own' || !card.allow) return;
+    const name = kind.name;
+    const deniedAt = denied.get(conversationId);
+    if (wait.refused || (deniedAt !== undefined && now - deniedAt < AUTO_PAUSE_AFTER_DENY_MS)) {
+      deps.log(`bridge: ${conversationId} tool approval card for ${name} left to a person: they pressed Deny in the app earlier`);
+      return;
+    }
+    if (wait.presses >= AUTO_ANSWERS_PER_EPISODE) {
+      deps.log(`bridge: ${conversationId} tool approval card for ${name} left to a person: it came back ${wait.presses} times in a row`);
+      return;
+    }
+    // A page that does not re-read the card's words before pressing (an extension from before 2026-10-29) is not trusted to press by itself.
+    if (card.recheck !== true) {
+      deps.log(`bridge: ${conversationId} tool approval card for ${name} left to a person: this browser extension does not re-check the card before pressing; reload it from the app's extension folder`);
+      return;
+    }
+    const asked = requestApprovalAnswer(conversationId, card.id, 'allow', now);
+    wait.auto = asked.ok;
+    if (asked.ok) wait.presses++;
+    // The card's own first lines only: the shared data can hold a key or a path.
+    const seen = splitCard(card).chrome.slice(0, 2).map(line => line.slice(0, 120)).join(' | ');
+    deps.log(asked.ok
+      ? `bridge: ${conversationId} tool approval card for ${name} auto-allowed (Allow once): ${seen}`
+      : `bridge: ${conversationId} tool approval card for ${name} not auto-allowed: ${asked.error}`);
+  } catch (error) {
+    // A fault here must not stop the wait from being noted: that is the stall this exists to end.
+    try { deps.log(`bridge: ${conversationId} tool approval card could not be answered automatically: ${error instanceof Error ? error.message : String(error)}`); } catch { /* nothing left to tell */ }
+  }
+}
+
 /** The card a person can answer in the app, with the last answer filed for it. */
 export function approvalCardView(conversationId: string, now = Date.now()): ApprovalCardView | null {
   const wait = waits.get(conversationId);
   if (!wait?.card || now - wait.seenAt >= APPROVAL_FRESH_MS) return null;
   expire(wait, now);
-  return { ...wait.card, lines: [...wait.card.lines], answer: wait.answer ? { choice: wait.answer.choice, outcome: wait.answer.outcome } : null };
+  return { id: wait.card.id, lines: [...wait.card.lines], allow: wait.card.allow, answer: wait.answer ? { choice: wait.answer.choice, outcome: wait.answer.outcome } : null };
 }
 
 /** A person's click in the app: one answer for exactly the card they were shown. */
@@ -193,17 +297,18 @@ export function requestApprovalAnswer(conversationId: string, cardId: string, ch
   if (choice === 'allow' && !wait.card.allow) return { ok: false, error: 'allow_unavailable' };
   expire(wait, now);
   if (wait.answer && wait.answer.outcome === null) return { ok: false, error: 'answer_pending' };
-  wait.answer = { token: randomUUID(), cardId, choice, at: now, outcome: null };
+  wait.answer = { token: randomUUID(), cardId, choice, words: { lines: [...wait.card.lines], data: wait.card.data ?? null, cut: wait.card.cut === true, extra: [...(wait.card.extra ?? [])] }, at: now, outcome: null };
+  if (choice === 'deny') { denied.set(conversationId, now); wait.refused = true; }
   return { ok: true, token: wait.answer.token };
 }
 
 /** The answer this chat's page should carry out on its next poll, if one is waiting. */
-export function approvalAnswerFor(conversationId: string, now = Date.now()): { token: string; cardId: string; choice: ApprovalChoice } | null {
+export function approvalAnswerFor(conversationId: string, now = Date.now()): { token: string; cardId: string; choice: ApprovalChoice; words: ApprovalWords } | null {
   const wait = waits.get(conversationId);
   if (!wait?.answer) return null;
   expire(wait, now);
   const answer = wait.answer;
-  return answer && answer.outcome === null ? { token: answer.token, cardId: answer.cardId, choice: answer.choice } : null;
+  return answer && answer.outcome === null ? { token: answer.token, cardId: answer.cardId, choice: answer.choice, words: { ...answer.words, lines: [...answer.words.lines], extra: [...answer.words.extra] } } : null;
 }
 
 /** The page's report on an answer it was given: pressed, or why not. Unknown tokens are ignored. */
@@ -221,8 +326,11 @@ export function parseApprovalCard(raw: string | null): ApprovalCardFacts | null 
     const value = JSON.parse(raw) as Partial<ApprovalCardFacts>;
     if (typeof value?.id !== 'string' || !/^[A-Za-z0-9-]{8,64}$/.test(value.id) || typeof value.allow !== 'boolean' || !Array.isArray(value.lines)) return null;
     const lines = value.lines.filter((line): line is string => typeof line === 'string')
-      .map(line => line.replace(/\s+/g, ' ').trim().slice(0, 300)).filter(Boolean).slice(0, 8);
-    return { id: value.id, lines, allow: value.allow };
+      .map(line => line.replace(/\s+/g, ' ').trim().slice(0, 300).trim()).filter(Boolean).slice(0, 8);
+    const data = typeof value.data === 'number' && Number.isInteger(value.data) && value.data >= 0 && value.data <= lines.length ? value.data : undefined;
+    const extra = Array.isArray(value.extra) ? value.extra.filter((line): line is string => typeof line === 'string')
+      .map(line => line.replace(/\s+/g, ' ').trim().slice(0, 100)).filter(Boolean).slice(0, 8) : [];
+    return { id: value.id, lines, allow: value.allow, ...(data !== undefined ? { data } : {}), cut: value.cut === true, recheck: value.recheck === true, extra };
   } catch { return null; }
 }
 
@@ -245,4 +353,5 @@ export function resetApprovalWaits(): void {
   for (const wait of waits.values()) if (wait.stale) clearTimeout(wait.stale);
   waits.clear();
   answered.clear();
+  denied.clear();
 }

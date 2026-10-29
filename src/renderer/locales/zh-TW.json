@@ -3399,5 +3399,7 @@
   "Commit from Review": "從檢閱提交",
   "Commit the chosen files, then push and open a pull request.": "提交所選檔案，然後推送並建立拉取要求。",
   "Your own chat style": "你自己的聊天風格",
-  "Rewrite how ChatGPT talks and writes in new chats.": "改寫 ChatGPT 在新聊天中說話和寫作的方式。"
+  "Rewrite how ChatGPT talks and writes in new chats.": "改寫 ChatGPT 在新聊天中說話和寫作的方式。",
+  "Answer tool approvals automatically": "自動回應工具核准",
+  "ChatGPT asks \"Allow ChatGPT to use Chat On Steroids …?\" again in every new chat and after a page reload, even after you chose Always allow. When on, the app presses Allow once on cards that name Chat On Steroids, so a run never waits for you, and logs each answer. It never answers a card ChatGPT's safety check raised (\"Suspicious instruction\") or one it does not recognize; those wait for you. Turn it off to approve each card yourself.": "即使你選擇了「一律允許」，ChatGPT 仍會在每個新對話中以及頁面重新載入後再次詢問「是否允許 ChatGPT 使用 Chat On Steroids …？」。開啟後，應用程式會在提到 Chat On Steroids 的卡片上按下「允許一次」，讓執行不必等你，並記錄每次回應。對於 ChatGPT 安全檢查跳出的卡片（「可疑指令」）或無法辨識的卡片，應用程式絕不會自動回應，它們會等你處理。關閉後可自行核准每張卡片。"
 }

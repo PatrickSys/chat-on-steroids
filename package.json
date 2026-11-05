@@ -1,6 +1,12 @@
 {
   "name": "chat-on-steroids",
   "version": "2.1.51",
+  "privateCarry": {
+    "schema": 1,
+    "id": "patrick-carry-20261105",
+    "upstream": "a552685cfe6427e5424b198c921f09133b7de4c6",
+    "fixes": ["history-retry", "approval-safe"]
+  },
   "description": "Local coding bridge for ChatGPT over MCP, with native desktop control and approved-folder capability limits.",
   "license": "MIT",
   "author": "Chat On Steroids",

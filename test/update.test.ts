@@ -26,6 +26,11 @@ const elevation: { exitCode: number | 'held'; finish: ((code: number) => void) |
 /** What icacls answers when the app repeats the installer's access grant: an exit code, or a spawn error. */
 const icacls: { calls: Array<{ file: string; args: string[] }>; result: number | string | null } = { calls: [], result: null };
 const cleanupFault = vi.hoisted(() => ({ file: '' }));
+const carryPackage = vi.hoisted(() => ({ marker: undefined as unknown }));
+vi.mock('../package.json', async importOriginal => {
+  const actual = await importOriginal<typeof import('../package.json')>();
+  return { ...actual, default: { ...actual.default, get privateCarry() { return carryPackage.marker; } } };
+});
 const cacheBoundary = vi.hoisted(() => ({ after: async (_operation: string, _file: string): Promise<void> => undefined }));
 vi.mock('node:fs/promises', async importOriginal => {
   const actual = await importOriginal<typeof import('node:fs/promises')>();
@@ -168,6 +173,7 @@ async function asPlatform(platform: string, appImage: string | undefined, run: (
 }
 
 beforeEach(() => {
+  carryPackage.marker = undefined;
   userData = mkdtempSync(path.join(tmpdir(), 'cos-update-'));
   packaged = true;
   spawned.length = 0;
@@ -184,6 +190,32 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllGlobals();
   rmSync(userData, { recursive: true, force: true });
+});
+
+describe('private carry update protection', () => {
+  it('shows a newer public release without downloading it for a private package', async () => {
+    carryPackage.marker = { schema: 1, id: 'private-test-build' };
+    const { asked } = github({ version: NEXT });
+    await checkForUpdates();
+    expect(updateStatus()).toMatchObject({ stage: 'idle', latest: NEXT });
+    expect(asked).toHaveLength(1);
+    expect(stagedArtifact('win32', 'x64')).toBeNull();
+    expect(markInstallOnQuit()).toBe(false);
+    await applyStagedUpdate();
+    expect(spawned).toEqual([]);
+  });
+
+  it.each([null, {}, { schema: 1, id: 'private-test-build' }])('refuses even stale staged authority at quit and explicit install (%j)', async marker => {
+    github({ version: NEXT });
+    await checkForUpdates();
+    expect(updateStatus().stage).toBe('ready');
+    expect(markInstallOnQuit(NEXT)).toBe(true);
+    carryPackage.marker = marker;
+    expect(markInstallOnQuit(NEXT)).toBe(false);
+    await applyStagedUpdate();
+    expect(spawned).toEqual([]);
+    expect(relaunched).toEqual([]);
+  });
 });
 
 describe('the file Get update opens for an installation that cannot update itself', () => {

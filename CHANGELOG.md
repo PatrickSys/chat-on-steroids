@@ -9,6 +9,10 @@ The app and the browser extension in `extension/` are versioned together. **Relo
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.51] — Private history-recovery repair
+
+This private Windows build stops automatic history Retry on idle chats. Chats with pending work keep their recovery, observe the app's provider hold, and retain retry backoff across page reloads. It has not been published as an upstream release.
+
 ## [2.1.50] — Move chats between projects, and chats that keep going
 
 You can now move a chat into another project by dragging it or from its menu, with Undo. Long chats keep going in more situations: when a step is not picked up, the app keeps trying, tells you, and lets you continue with one click. The browser extension now updates itself even while long chats run, and very long chats no longer slow the app down.

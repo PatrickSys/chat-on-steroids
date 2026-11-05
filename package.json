@@ -16,7 +16,7 @@
       "durable-pickup-budget",
       "command-output-drain"
     ],
-    "builtFrom": "924a669ecf29e864ef43b422085fa879edfe23c9"
+    "builtFrom": "e892b3a935981b0ec2465782e6f73d84774fd6b5"
   },
   "description": "Local coding bridge for ChatGPT over MCP, with native desktop control and approved-folder capability limits.",
   "license": "MIT",

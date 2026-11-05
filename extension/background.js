@@ -4337,10 +4337,13 @@ const HANDLERS = {
     const conversationId = cleanConversationId(message.conversationId);
     const key = String(source.tab);
     if (!conversationId || !ownsDocument(source) || tabConversations[key] !== conversationId) return { ok: false };
+    const result = await call(`/activity?conversationId=${encodeURIComponent(conversationId)}&loadRecovery=1`);
+    if (!ownsDocument(source) || tabConversations[key] !== conversationId) return { ok: false, error: 'stale_document' };
+    if (!result.ok || result.data?.pending !== true || result.data.retryAt > Date.now()) return result;
     tabReuses[key] = { documentId: source.documentId, conversationId, at: Date.now() };
     tabReuses = Object.fromEntries(Object.entries(tabReuses).slice(-200));
     void persistLive().catch(() => undefined);
-    return { ok: true };
+    return result;
   },
   async core_plugin(message, _sender, source) {
     if (!ownsDocument(source)) return { ok: false };

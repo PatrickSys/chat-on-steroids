@@ -3870,6 +3870,12 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const since = Number(url.searchParams.get('since') ?? 0);
     const goalClient = (url.searchParams.get('goalClient') ?? '').slice(0, 100);
     if (!id) return json(res, 400, { error: 'bad_conversation_id' }, origin);
+    // A page Retry is a browser recovery action, not permission supplied by an open tab.
+    // Read its existing owners at the action boundary without spending their pickup budget.
+    if (url.searchParams.get('loadRecovery') === '1') {
+      const pending = opensNewWork(req, '/activity', id) && await conversationLoadRecoveryOwed(id);
+      return json(res, 200, { pending, retryAt: providerHistoryBackoff(id) }, origin);
+    }
     // A page asking about this chat is the one thing that disproves the no-page verdict, and it
     // is the only thing that lifts it.
     pagelessChats.delete(id);
@@ -8578,7 +8584,7 @@ interface Repair {
 const TURN_SCOPED_REPAIRS: ReadonlySet<Repair['reason']> = new Set(['unattributed', 'assistant-error']);
 
 const repairsInFlight = new Map<string, Repair>();
-/** Exact provider Retry-After deadline for conversation-history reads. It delays browser recovery; it never creates one. */
+/** Provider history hold, including the dialog's fallback wait. It delays recovery; it never creates one. */
 const providerHistoryBackoffUntil = new Map<string, number>();
 /*
  * A history limit that answers the retry after its own wait with another 429 is still running,
@@ -9478,7 +9484,10 @@ async function noteRecoveryObservations(
         grant?.sessionId === sessionId && (!item.turnId || grant.turnId === item.turnId) &&
         recoveryInputAllowed(sessionId, conversationId);
       if (keepForContinue) {
-        grant!.until = Math.max(grant!.until, providerHistoryBackoff(conversationId) ?? item.time + ACCESS_LIMIT_HOLD_MS);
+        const limitedUntil = providerHistoryBackoff(conversationId) ?? item.time + ACCESS_LIMIT_HOLD_MS;
+        grant!.until = Math.max(grant!.until, limitedUntil);
+        // Page Retry must observe the same fallback wait this existing watch already honours.
+        providerHistoryBackoffUntil.set(conversationId, limitedUntil);
         continue;
       }
       if (!preserveGoalRecovery) endActivity(conversationId);
@@ -10159,9 +10168,10 @@ function notePickupActivity(conversationId: string): void {
  * chat and shares its reload budget. A reload never generates a second obligation. */
 type OwedPickup = { conversationId: string; sessionId: string; replyId: string; acceptedAt: number; listenUntil: number; pro: boolean; queued: boolean;
   inputId?: string; goalReplyId?: string; pickupAttempts: number; pickupNextAt?: number; pickupStoppedAt?: number };
-async function owedPickups(now: number): Promise<Map<string, OwedPickup>> {
+async function owedPickups(now: number, conversationId?: string): Promise<Map<string, OwedPickup>> {
   const owed = new Map<string, OwedPickup>();
   for (const reply of pendingGoalReplies(now)) {
+    if (conversationId && reply.conversationId !== conversationId) continue;
     const pending = goalPendingReplyFor(reply.conversationId);
     if (!pending) continue;
     if (!goalActiveFor(reply.conversationId) || goalDraftNeedsIntervention(reply.conversationId) || !await loopReplyHasAuthority(reply.sessionId, reply.conversationId, pending.turnId) ||
@@ -10182,6 +10192,7 @@ async function owedPickups(now: number): Promise<Map<string, OwedPickup>> {
       listenUntil: pending.listenUntil ?? 0, pro: loopAfterTurnFor(reply.conversationId), queued: false });
   }
   for (const input of await pendingQueuedPickups()) {
+    if (conversationId && input.conversationId !== conversationId) continue;
     const prior = owed.get(input.conversationId);
     const goalPending = goalPendingReplyFor(input.conversationId);
     const goalSource = goalPending
@@ -10208,6 +10219,23 @@ async function owedPickups(now: number): Promise<Map<string, OwedPickup>> {
   // re-check and the handout re-check with one rule instead of three.
   for (const id of owed.keys()) if (waitingForSubAgents(id)) owed.delete(id);
   return owed;
+}
+
+/** The same work owners as browser recovery, without creating or claiming a repair. */
+async function conversationLoadRecoveryOwed(id: string): Promise<boolean> {
+  const session = await findSessionByConversation(id, { requireUnique: true });
+  const permitted = () => !isChatBlocked(id) && !stopRequestedFor(id) && workerRecoveryAllowed(id) &&
+    !supersededSourceConversations().includes(id);
+  if (!session || session.browserRecoveryDismissedAt !== undefined || !permitted()) return false;
+  const continuation = continuationForSession(session.id);
+  const compacting = continuation?.from === id;
+  const pending = chatIsWorkingNow(id) || compacting ||
+    await hasQueuedAfterTurnInput(session.id) ||
+    (await pendingBrowserInputs()).some(input => input.conversationId === id) ||
+    (await owedPickups(Date.now(), id)).has(id);
+  // Owner/history reads yield. Stop, a rebind or deliberate closure may have happened meanwhile.
+  const current = await getSession(session.id);
+  return pending && current?.conversationId === id && current.browserRecoveryDismissedAt === undefined && permitted();
 }
 
 /** One chat whose outcome a caller of inspectOwedPickups needs: what started for it, if anything. */

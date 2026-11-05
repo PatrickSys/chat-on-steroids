@@ -12656,7 +12656,8 @@
    * Presses ChatGPT's own Retry when a conversation route shows its "could not be loaded"
    * surface instead of the chat. Seen live after a reload that landed mid-turn: the model went
    * on calling tools server-side while this page showed nothing, so the turn could never be
-   * seen to end. The surface must hold for LOAD_FAILURE_SETTLE_MS first — the shell passes
+   * seen to end. Only the app's current work can authorize a press; opening an idle chat cannot.
+   * The surface must hold for LOAD_FAILURE_SETTLE_MS first — the shell passes
    * through empty states while it mounts — and later presses back off to once a minute, and stay
    * there: measured the same day, presses in the first half-minute after a reload could fail while
    * a press a minute later restored the chat, so a schedule that gave up after a few minutes left
@@ -12674,7 +12675,8 @@
    */
   const LOAD_FAILURE_LIMITED_BACKOFF_MS = [0, 120_000, 240_000, 480_000, 900_000, 1_800_000, 3_600_000];
   /*
-   * The step reached survives a reload of the same chat in this tab. The app reloads a limited
+   * Both schedules and provider deadlines survive a reload, separately for each chat in this tab.
+   * The app reloads a limited
    * chat after each of its holds, and a fresh page used to start again at the first step: every
    * reload came with presses after 0, 2 and 4 minutes, 23 rounds in 8.5 hours (#1882,
    * 2026-11-05). A step older than the longest one plus a quarter hour is forgotten, the same
@@ -12686,24 +12688,33 @@
   let loadFailureRetries = 0;
   let loadFailureLimited = false;
   let loadFailureRoute = null;
-  let loadFailureToldAt = 0;
   let loadFailureStored = false;
   let loadFailureLastPress = 0;
+  let loadFailureRetryAt = 0;
+  let loadFailureChecking = false;
+  let loadFailureCheckAt = 0;
+  const loadFailureStorageKey = route => `${LOAD_FAILURE_LIMITED_STORAGE}:${route}`;
   function restoreLimitedLoadFailure(route, now) {
     try {
-      const raw = sessionStorage.getItem(LOAD_FAILURE_LIMITED_STORAGE);
+      if (!route) return;
+      const raw = sessionStorage.getItem(loadFailureStorageKey(route)) ?? sessionStorage.getItem(LOAD_FAILURE_LIMITED_STORAGE);
       if (raw === null) return;
       loadFailureStored = true;
       const saved = raw.length <= 512 ? JSON.parse(raw) : null;
+      const hold = saved && Number.isFinite(saved.retryAt) && saved.retryAt > now &&
+        saved.retryAt - now <= 24 * 60 * 60_000 ? saved.retryAt : 0;
       if (saved && typeof saved === 'object' && route && saved.conversationId === route &&
-          Number.isInteger(saved.retries) && saved.retries > 0 && saved.retries <= 1000 &&
-          Number.isFinite(saved.at) && saved.at <= now && now - saved.at <= LOAD_FAILURE_LIMITED_MEMORY_MS) {
-        loadFailureRetries = saved.retries;
-        loadFailureLimited = true;
+          Number.isInteger(saved.retries) && saved.retries >= 0 && saved.retries <= 1000 &&
+          Number.isFinite(saved.at) && saved.at <= now && (hold || now - saved.at <= LOAD_FAILURE_LIMITED_MEMORY_MS)) {
+        loadFailureRetries = now - saved.at <= LOAD_FAILURE_LIMITED_MEMORY_MS ? saved.retries : 0;
+        loadFailureLimited = saved.limited !== false;
         loadFailureLastPress = saved.at;
+        loadFailureSince = saved.at;
+        loadFailureRetryAt = hold;
       } else if (route) {
         // Another chat's, an expired or a damaged entry: removed, so it cannot come back when the
         // tab returns to its chat later. A page between routes keeps it.
+        sessionStorage.removeItem(loadFailureStorageKey(route));
         sessionStorage.removeItem(LOAD_FAILURE_LIMITED_STORAGE);
         loadFailureStored = false;
       }
@@ -12713,11 +12724,13 @@
   }
   function rememberLimitedLoadFailure(route, now) {
     try {
-      if (loadFailureLimited && route) {
-        sessionStorage.setItem(LOAD_FAILURE_LIMITED_STORAGE,
-          JSON.stringify({ conversationId: route, retries: loadFailureRetries, at: now }));
+      if (route && (loadFailureRetries > 0 || loadFailureRetryAt > now)) {
+        sessionStorage.setItem(loadFailureStorageKey(route),
+          JSON.stringify({ conversationId: route, retries: loadFailureRetries, limited: loadFailureLimited,
+            at: loadFailureLastPress || loadFailureSince || now, retryAt: loadFailureRetryAt }));
         loadFailureStored = true;
       } else if (loadFailureStored) {
+        sessionStorage.removeItem(loadFailureStorageKey(route));
         sessionStorage.removeItem(LOAD_FAILURE_LIMITED_STORAGE);
         loadFailureStored = false;
       }
@@ -12725,15 +12738,17 @@
       // This document still keeps its own step.
     }
   }
-  function recoverConversationLoad(now = Date.now()) {
+  async function recoverConversationLoad(now = Date.now()) {
     const route = CLF_DOM.conversationId();
     if (route !== loadFailureRoute) {
       loadFailureRoute = route;
-      loadFailureToldAt = 0;
+      loadFailureStored = false;
       loadFailureSince = 0;
       loadFailureRetries = 0;
       loadFailureLimited = false;
       loadFailureLastPress = 0;
+      loadFailureRetryAt = 0;
+      loadFailureCheckAt = 0;
       restoreLimitedLoadFailure(route, now);
     }
     // The provider has already told this exact history read when it may be tried again.
@@ -12742,6 +12757,8 @@
     // established settle/backoff logic below resumes unchanged.
     if (pendingHistoryRateLimit?.conversationId === route) {
       loadFailureLimited = true;
+      loadFailureRetryAt = Math.max(loadFailureRetryAt, pendingHistoryRateLimit.retryAt);
+      rememberLimitedLoadFailure(route, now);
       if (pendingHistoryRateLimit.retryAt > now) return false;
       pendingHistoryRateLimit = null;
     }
@@ -12750,16 +12767,11 @@
       loadFailureSince = 0;
       if (CLF_DOM.turns().length) {
         loadFailureRetries = 0;
+        loadFailureRetryAt = 0;
         loadFailureLimited = false;
         if (loadFailureStored) rememberLimitedLoadFailure(route, now);
       }
       return false;
-    }
-    // Whoever presses Retry here, the tab may leave this chat for ChatGPT's home page. Say so first,
-    // so that departure is not taken for the user closing the chat (#1086). At most every 30 s.
-    if (route && now - loadFailureToldAt >= 30_000) {
-      loadFailureToldAt = now;
-      void ask({ type: 'load_failure', conversationId: route }).catch(() => undefined);
     }
     // A page that stayed open on this chat forgets a step whose last press is as old as a stored
     // one would be, and starts over, the same as after a reload.
@@ -12773,13 +12785,42 @@
     if (!loadFailureSince) loadFailureSince = now;
     const schedule = loadFailureLimited ? LOAD_FAILURE_LIMITED_BACKOFF_MS : LOAD_FAILURE_BACKOFF_MS;
     const wait = LOAD_FAILURE_SETTLE_MS + schedule[Math.min(loadFailureRetries, schedule.length - 1)];
-    if (now - loadFailureSince < wait) return false;
-    loadFailureRetries++;
-    loadFailureSince = now;
-    loadFailureLastPress = now;
-    if (loadFailureLimited) rememberLimitedLoadFailure(route, now);
-    retry.click();
-    return true;
+    if (now - loadFailureSince < wait || now < loadFailureRetryAt || now < loadFailureCheckAt ||
+        loadFailureChecking || !route || stopRequestedAt) return false;
+    const forEpoch = epoch;
+    loadFailureChecking = true;
+    try {
+      // The bridge owns work and provider holds. An idle tab is never its own retry grant.
+      // The worker also marks this exact document's possible departure, only on permission.
+      const reply = await ask({ type: 'load_failure', conversationId: route });
+      if (!alive || epoch !== forEpoch || CLF_DOM.conversationId() !== route || stopRequestedAt ||
+          CLF_DOM.conversationLoadFailure?.() !== retry) return false;
+      const checkNow = Math.max(now, Date.now());
+      const hold = Math.max(Number.isFinite(reply?.data?.retryAt) ? reply.data.retryAt : 0,
+        pendingHistoryRateLimit?.conversationId === route ? pendingHistoryRateLimit.retryAt : 0);
+      if (Number.isFinite(hold) && hold > checkNow && hold - checkNow <= 24 * 60 * 60_000) {
+        loadFailureLimited = true;
+        loadFailureRetryAt = Math.max(loadFailureRetryAt, hold);
+        rememberLimitedLoadFailure(route, checkNow);
+      }
+      if (reply?.ok !== true || reply.data?.pending !== true) {
+        // Keep the failed idle page silent. A later check can see newly queued real work.
+        loadFailureCheckAt = checkNow + 30_000;
+        return false;
+      }
+      if (checkNow < loadFailureRetryAt) return false;
+      loadFailureRetries++;
+      loadFailureSince = checkNow;
+      loadFailureLastPress = checkNow;
+      rememberLimitedLoadFailure(route, checkNow);
+      retry.click();
+      return true;
+    } catch {
+      loadFailureCheckAt = Math.max(now, Date.now()) + 30_000;
+      return false;
+    } finally {
+      loadFailureChecking = false;
+    }
   }
 
   let activityTimer = null;

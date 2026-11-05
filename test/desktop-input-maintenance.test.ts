@@ -732,7 +732,10 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
     const sender = { tab, documentId: 'failed-document', frameId: 0, url: tab.url };
     const source = await h.authorizeDocument(sender, { navigationEpoch: 1 });
     await h.noteTabConversation(source, secondId);
-    if (reported) expect(await h.loadFailure({ conversationId: secondId }, sender, source)).toEqual({ ok: true });
+    const fetch = h.fetch.getMockImplementation()!;
+    h.fetch.mockImplementation(async (url, init) => new URL(url).searchParams.get('loadRecovery') === '1'
+      ? { ok: true, status: 200, json: async () => ({ pending: true, retryAt: null }) } : fetch(url, init));
+    if (reported) expect(await h.loadFailure({ conversationId: secondId }, sender, source)).toEqual({ ok: true, status: 200, data: { pending: true, retryAt: null } });
     // The page reported departure while Chrome is navigating to home; its
     // committed tab.url still names the now-left conversation.
     tab.pendingUrl = 'https://chatgpt.com/';
@@ -740,6 +743,29 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
     const closes = h.fetch.mock.calls.filter(([url]) => new URL(url).pathname === '/closed')
       .map(([, init]) => JSON.parse(String(init!.body)));
     expect(closes).toEqual([{ conversationId: secondId, manual: !reported }]);
+  });
+
+  it.each(['idle', 'held', 'replaced'])('does not borrow a page Retry departure grant when its work is %s', async mode => {
+    const h = await worker([]);
+    const tab: Tab = { id: 7, url: `https://chatgpt.com/c/${secondId}`, active: false };
+    h.tabs.push(tab);
+    const sender = { tab, documentId: 'failed-document', frameId: 0, url: tab.url };
+    const source = await h.authorizeDocument(sender, { navigationEpoch: 1 });
+    await h.noteTabConversation(source, secondId);
+    const fetch = h.fetch.getMockImplementation()!;
+    h.fetch.mockImplementation(async (url, init) => {
+      if (new URL(url).searchParams.get('loadRecovery') !== '1') return fetch(url, init);
+      if (mode === 'replaced') await h.authorizeDocument({ ...sender, documentId: 'replacement-document' }, { navigationEpoch: 2 });
+      return { ok: true, status: 200, json: async () => ({ pending: mode !== 'idle', retryAt: mode === 'held' ? Date.now() + 60_000 : null }) };
+    });
+    const result = await h.loadFailure({ conversationId: secondId }, sender, source);
+    if (mode === 'replaced') expect(result).toEqual({ ok: false, error: 'stale_document' });
+    else {
+      tab.pendingUrl = 'https://chatgpt.com/';
+      await h.closed({ conversationId: secondId }, sender, source);
+      expect(h.fetch.mock.calls.filter(([url]) => new URL(url).pathname === '/closed')
+        .map(([, init]) => JSON.parse(String(init!.body)))).toEqual([{ conversationId: secondId, manual: true }]);
+    }
   });
 
   it('accepts a load-failure report only for the chat its own document shows', async () => {

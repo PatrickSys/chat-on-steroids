@@ -27,10 +27,7 @@ const elevation: { exitCode: number | 'held'; finish: ((code: number) => void) |
 const icacls: { calls: Array<{ file: string; args: string[] }>; result: number | string | null } = { calls: [], result: null };
 const cleanupFault = vi.hoisted(() => ({ file: '' }));
 const carryPackage = vi.hoisted(() => ({ marker: undefined as unknown }));
-vi.mock('../package.json', async importOriginal => {
-  const actual = await importOriginal<typeof import('../package.json')>();
-  return { ...actual, default: { ...actual.default, get privateCarry() { return carryPackage.marker; } } };
-});
+vi.mock('../package.json', () => ({ default: { get privateCarry() { return carryPackage.marker; } } }));
 const cacheBoundary = vi.hoisted(() => ({ after: async (_operation: string, _file: string): Promise<void> => undefined }));
 vi.mock('node:fs/promises', async importOriginal => {
   const actual = await importOriginal<typeof import('node:fs/promises')>();

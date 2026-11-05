@@ -4,7 +4,6 @@ import { createRequire, stripTypeScriptTypes } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
-import { promisify } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { listInstalledCodexPlugins } from '../src/main/codex-plugin-runtime.js';
 import { deleteEnvValue, envValue, normalizeEnvironment } from '../src/main/env.js';
@@ -94,27 +93,42 @@ describe.runIf(process.platform === 'win32')('Windows Codex runtime launch bound
       }] }));
     `);
     const parent = path.join(runtime, 'parent.cjs');
+    const trace = path.join(runtime, 'launch-trace.log');
     await writeFile(parent, `
+      const fs = require('node:fs');
+      const trace = message => fs.appendFileSync(${JSON.stringify(trace)}, Date.now() + ' ' + message + '\\n');
+      trace('parent entered');
       const path = require('node:path');
       const { app } = require('electron');
       const root = path.dirname(__dirname);
       app.setPath('userData', path.join(root, 'user-data'));
       app.disableHardwareAcceleration();
       app.whenReady().then(async () => {
+        trace('app ready');
         const { setEnvValue } = await import('./env.js');
         setEnvValue(process.env, 'PATH', root);
         const { listInstalledCodexPlugins } = await import('./codex-plugin-runtime.js');
+        trace('production plugin call');
         const plugins = await listInstalledCodexPlugins(root, root);
+        trace('production plugin returned');
         if (plugins.length !== 1 || plugins[0].pluginId !== 'fixture@local-market') throw new Error('Wrong fixture snapshot');
         process.stdout.write('CODEX_NODE_LAUNCH_VERIFIED');
         app.exit(0);
-      }).catch(error => { process.stderr.write(String(error)); app.exit(1); });
+      }).catch(error => { trace('failure: ' + String(error)); process.stderr.write(String(error)); app.exit(1); });
     `);
     const environment = normalizeEnvironment();
     deleteEnvValue(environment, 'ELECTRON_RUN_AS_NODE');
     const electron = createRequire(import.meta.url)('electron') as string;
-    const result = await promisify(execFile)(electron, [parent], {
-      env: environment, cwd: directory, windowsHide: true, timeout: 25_000, maxBuffer: 32_768
+    const events: string[] = [];
+    const result = await new Promise<{ stdout: string }>((resolve, reject) => {
+      const child = execFile(electron, [parent], {
+        env: environment, cwd: directory, windowsHide: true, timeout: 25_000, maxBuffer: 32_768
+      }, (error, stdout) => error ? reject(error) : resolve({ stdout }));
+      child.on('exit', (code, signal) => events.push(`exit ${code} ${signal} at ${Date.now()}`));
+      child.on('close', (code, signal) => events.push(`close ${code} ${signal} at ${Date.now()}`));
+    }).catch(async error => {
+      const progress = await readFile(trace, 'utf8').catch(() => 'parent never entered');
+      throw new Error(`Electron fixture failed: code=${error.code} signal=${error.signal} killed=${error.killed}\n${events.join('\n')}\n${progress}\n${error.stderr || ''}`, { cause: error });
     });
     expect(result.stdout).toContain('CODEX_NODE_LAUNCH_VERIFIED');
   }, 35_000);

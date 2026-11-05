@@ -4,7 +4,7 @@
   "privateCarry": {
     "schema": 1,
     "id": "patrick-carry-20261105",
-    "upstream": "0218cf8f3fccdf11f92e524715f10c04c04cf758",
+    "upstream": "16ed056fc8345d0edc4e8daf9cf7aa33938439cc",
     "fixes": [
       "history-retry",
       "approval-safe",
@@ -16,7 +16,7 @@
       "durable-pickup-budget",
       "command-output-drain"
     ],
-    "builtFrom": "e892b3a935981b0ec2465782e6f73d84774fd6b5"
+    "builtFrom": "8f26d24252360ebd59dfdf28afa4317f8ea9030e"
   },
   "description": "Local coding bridge for ChatGPT over MCP, with native desktop control and approved-folder capability limits.",
   "license": "MIT",

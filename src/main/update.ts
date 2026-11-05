@@ -49,6 +49,11 @@ import { app } from 'electron';
 import { logInfo, logWarn } from './logger.js';
 import { APP_VERSION } from './version.js';
 import { isNewer, type UpdateStatus } from '../shared/types.js';
+import packageMetadata from '../../package.json';
+
+// A private carry is updated by its tested patch replay, never a public installer that
+// drops those patches. Presence fails closed even if the package marker is damaged.
+const privateCarryBuild = (): boolean => packageMetadata.privateCarry !== undefined;
 
 const REPO = 'totec448-spec/chat-on-steroids';
 const LATEST_RELEASE_API = `https://api.github.com/repos/${REPO}/releases/latest`;
@@ -101,7 +106,7 @@ export function stagedArtifact(
   appImage: string | undefined = process.env.APPIMAGE,
   packaged: boolean = app.isPackaged
 ): { name: string; kind: 'installer' | 'appimage'; target: string } | null {
-  if (!packaged) return null;
+  if (!packaged || privateCarryBuild()) return null;
   if (arch !== 'x64' && arch !== 'arm64') return null;
   if (platform === 'win32') return { name: `Chat-On-Steroids-Setup-${arch}.exe`, kind: 'installer', target: '' };
   if (platform === 'linux' && appImage) {
@@ -560,6 +565,7 @@ async function download(version: string, name: string, expected: string): Promis
  * The caller quits. This module still never does.
  */
 export function markInstallOnQuit(expectedVersion?: string): boolean {
+  if (privateCarryBuild()) return false;
   if (!staged || (expectedVersion !== undefined && staged.version !== expectedVersion)) return false;
   runAfterInstall = true;
   if (status.notInstalled) set({ notInstalled: null });
@@ -656,7 +662,7 @@ export async function applyStagedUpdate(): Promise<void> {
   const relaunch = runAfterInstall;
   staged = null;
   runAfterInstall = false;
-  if (!ready) return;
+  if (!ready || privateCarryBuild()) return;
   try {
     if ((await fileDigest(ready.file)) !== ready.digest) throw new Error('the staged artifact changed after verification');
     if (ready.kind === 'installer') {

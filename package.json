@@ -96,5 +96,14 @@
     "@anthropic-ai/mcpb": {
       "tmp": "0.2.7"
     }
+  },
+  "privateCarry": {
+    "schema": 1,
+    "id": "patrick-carry-20261105",
+    "upstream": "a552685cfe6427e5424b198c921f09133b7de4c6",
+    "fixes": [
+      "history-retry",
+      "approval-safe"
+    ]
   }
 }

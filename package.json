@@ -1,11 +1,22 @@
 {
   "name": "chat-on-steroids",
-  "version": "2.1.51",
+  "version": "2.1.52",
   "privateCarry": {
     "schema": 1,
     "id": "patrick-carry-20261105",
-    "upstream": "a552685cfe6427e5424b198c921f09133b7de4c6",
-    "fixes": ["history-retry", "approval-safe", "settled-generation-proof", "document-owned-recovery", "offline-objective-handover", "loop-no-tool-diagnostic", "silence-diagnostic-only", "durable-pickup-budget", "command-output-drain"]
+    "upstream": "d7ac0efb4ef7d880e8cabd834da106db0e3e5cc1",
+    "fixes": [
+      "history-retry",
+      "approval-safe",
+      "settled-generation-proof",
+      "document-owned-recovery",
+      "offline-objective-handover",
+      "loop-no-tool-diagnostic",
+      "silence-diagnostic-only",
+      "durable-pickup-budget",
+      "command-output-drain"
+    ],
+    "builtFrom": "1b3ad94d8ea401b5948d932797edf15e5de8050b"
   },
   "description": "Local coding bridge for ChatGPT over MCP, with native desktop control and approved-folder capability limits.",
   "license": "MIT",

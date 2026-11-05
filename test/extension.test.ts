@@ -1602,7 +1602,7 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
     const fetch = vi.fn(async (input: string) => {
       const url = new URL(input);
       if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
-      if (url.pathname === '/repairs/claim') { trace.push('claim'); return response(200, { allowed: true }); }
+      if (url.pathname === '/repairs/claim') { trace.push('claim'); return response(200, { allowed: true, committed: true }); }
       if (url.pathname === '/status') {
         if (url.searchParams.has('repaired')) trace.push('repaired');
         // Released once the repair is due: a lease whose release keeps failing rejected every later pass.

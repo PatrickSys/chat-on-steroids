@@ -17135,7 +17135,7 @@ describe('the goal loop over the bridge', () => {
 
   it.each(['browser', 'native'])('waits for a new answer before applying a new Offline Goal objective from %s', async surface => {
     await pair();
-    const chat = 'cafe0189-0000-4000-8000-000000000189';
+    const chat = randomUUID();
     await saveConfig({
       ...suiteConfig,
       sessions: { ...suiteConfig.sessions, record: true },

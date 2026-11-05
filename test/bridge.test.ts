@@ -18553,7 +18553,7 @@ describe('the goal loop over the bridge', () => {
   });
 
   it.each([false, true].flatMap(restored => [false, true].map(failed => ({ restored, failed }))))(
-    'bounds Goal pickup at three attempts (restored $restored, failed action $failed)', async ({ restored, failed }) => {
+    'keeps Goal pickup failures within persisted deadlines (restored $restored, failed action $failed)', async ({ restored, failed }) => {
     vi.useFakeTimers();
     try {
       await pair();

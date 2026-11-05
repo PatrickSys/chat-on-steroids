@@ -5,7 +5,7 @@
     "schema": 1,
     "id": "patrick-carry-20261105",
     "upstream": "a552685cfe6427e5424b198c921f09133b7de4c6",
-    "fixes": ["history-retry", "approval-safe"]
+    "fixes": ["history-retry", "approval-safe", "settled-generation-proof", "document-owned-recovery", "offline-objective-handover", "loop-no-tool-diagnostic", "silence-diagnostic-only", "durable-pickup-budget", "command-output-drain"]
   },
   "description": "Local coding bridge for ChatGPT over MCP, with native desktop control and approved-folder capability limits.",
   "license": "MIT",

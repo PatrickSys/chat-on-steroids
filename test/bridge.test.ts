@@ -9518,6 +9518,60 @@ describe('unattributed activity recovery', () => {
     OTHER = `efefefef-1111-2222-3333-${suffix}`;
   });
 
+  it('denies page history Retry for an idle chat even with Goal enabled', async () => {
+    await pair();
+    await events(PRIME, [{ kind: 'user_message', time: Date.now(), messageId: 'idle-history-question', text: 'A settled question' }]);
+    const goal = await import('../src/main/goal.js');
+    await goal.setGoalSwitchNow(PRIME, 'goal', true);
+    const before = goal.goalPendingReplyFor(PRIME);
+    expect((await request('GET', `/activity?conversationId=${PRIME}&loadRecovery=1`)).body).toEqual({ pending: false, retryAt: null });
+    expect(goal.goalPendingReplyFor(PRIME)).toEqual(before);
+    expect((await request('GET', `/activity?conversationId=${OTHER}&loadRecovery=1`)).body).toEqual({ pending: false, retryAt: null });
+  });
+
+  it('authorizes page history Retry for a live turn, with its provider hold and Stop fence', async () => {
+    await pair();
+    await events(PRIME, [openTurn('page-history-working')]);
+    const route = `/activity?conversationId=${PRIME}&loadRecovery=1`;
+    expect((await request('GET', route)).body).toEqual({ pending: true, retryAt: null });
+    const retryAt = Date.now() + 5 * 60_000;
+    await events(PRIME, [{ kind: 'chat_error', time: Date.now(), turnId: 'page-history-working', blocking: true,
+      recoverable: false, retryAt, text: 'ChatGPT temporarily limited access to this conversation history.' }]);
+    expect((await request('GET', route)).body).toEqual({ pending: true, retryAt });
+    setChatBlocked(PRIME, true);
+    expect((await request('GET', route)).body.pending).toBe(false);
+    setChatBlocked(PRIME, false);
+    await events(PRIME, [endTurn('page-history-working', 'stopped')]);
+    expect((await request('GET', route)).body.pending).toBe(false);
+  });
+
+  it('authorizes page history Retry for queued and claimed authored input in the exact session', async () => {
+    await pair();
+    await events(PRIME, [{ kind: 'user_message', time: Date.now(), messageId: 'queued-history-question', text: 'Prior question' }]);
+    const session = (await findSessionByConversation(PRIME))!;
+    const input = await import('../src/main/session/input.js');
+    const row = await input.enqueueInput({ id: randomUUID(), sessionId: session.id, text: 'New real work',
+      mode: 'auto', dueAt: Date.now(), model: null, reasoningEffort: null });
+    const route = `/activity?conversationId=${PRIME}&loadRecovery=1`;
+    expect((await request('GET', route)).body.pending).toBe(true);
+    expect(await input.claimBrowserInput(row.id, 'history-page', PRIME, true)).not.toBeNull();
+    expect((await request('GET', route)).body.pending).toBe(true);
+    expect((await request('GET', `/activity?conversationId=${OTHER}&loadRecovery=1`)).body.pending).toBe(false);
+    await request('POST', '/closed', { body: { conversationId: PRIME, manual: true } });
+    expect((await request('GET', route)).body.pending).toBe(false);
+  });
+
+  it('does not manufacture page history Retry authority from an unconfirmed legacy browser send', async () => {
+    await pair();
+    await events(PRIME, [{ kind: 'user_message', time: Date.now(), messageId: 'legacy-history-question', text: 'Prior question' }]);
+    const session = (await findSessionByConversation(PRIME))!;
+    const input = await import('../src/main/session/input.js');
+    const row = await input.enqueueInput({ id: randomUUID(), sessionId: session.id, text: 'Ambiguous old handout',
+      mode: 'auto', dueAt: Date.now(), model: null, reasoningEffort: null });
+    expect(await input.claimBrowserInput(row.id, 'legacy-history-page', PRIME)).not.toBeNull();
+    expect((await request('GET', `/activity?conversationId=${PRIME}&loadRecovery=1`)).body.pending).toBe(false);
+  });
+
   it('withholds a recovery ETA when the browser has no eligible active chat', async () => {
     await pair();
     await request('GET', '/status');
@@ -12453,6 +12507,7 @@ describe('unattributed activity recovery', () => {
       const notice = () => events(PRIME, [{ kind: 'chat_error', time: Date.now(), turnId: 'limited-goal',
         recoverable: false, blocking: true, text: 'provider access limit' }]);
       await notice();
+      expect((await request('GET', `/activity?conversationId=${PRIME}&loadRecovery=1`)).body.retryAt).toBeNull();
       expect(await maintenance()).toBeNull();
       await vi.advanceTimersByTimeAsync(CHAT_SILENCE_MS - 1);
       await notice(); // Re-rendering cannot renew the original deadline.
@@ -12483,6 +12538,8 @@ describe('unattributed activity recovery', () => {
       await attributed(PRIME, false, Date.now());
       await events(PRIME, [{ kind: 'chat_error', time: Date.now(), turnId: 'limited-continue',
         recoverable: false, blocking: true, text: 'provider access limit' }]);
+      expect((await request('GET', `/activity?conversationId=${PRIME}&loadRecovery=1`)).body)
+        .toEqual({ pending: true, retryAt: Date.now() + ACCESS_LIMIT_HOLD_MS });
       // No reload against the live limit.
       await vi.advanceTimersByTimeAsync(ACCESS_LIMIT_HOLD_MS - 1000);
       await sweepStaleSwarm(Date.now());
@@ -12491,6 +12548,27 @@ describe('unattributed activity recovery', () => {
       await vi.advanceTimersByTimeAsync(2000);
       await sweepStaleSwarm(Date.now());
       expect(await maintenance()).toMatchObject({ conversationId: PRIME, reason: 'silence' });
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('keeps the projected fallback hold stable and lets a longer Retry-After win', async () => {
+    vi.useFakeTimers();
+    try {
+      await pair();
+      getConfig().ui.autoContinue = true;
+      await events(PRIME, [openTurn('fallback-hold')]);
+      await attributed(PRIME, false, Date.now());
+      const notice = (retryAt?: number) => events(PRIME, [{ kind: 'chat_error', time: Date.now(),
+        turnId: 'fallback-hold', recoverable: false, blocking: true, text: 'provider access limit', retryAt }]);
+      const route = `/activity?conversationId=${PRIME}&loadRecovery=1`;
+      const fallback = Date.now() + ACCESS_LIMIT_HOLD_MS;
+      await notice();
+      await vi.advanceTimersByTimeAsync(1000);
+      await notice();
+      expect((await request('GET', route)).body.retryAt).toBe(fallback);
+      const longer = Date.now() + 10 * 60_000;
+      await notice(longer);
+      expect((await request('GET', route)).body.retryAt).toBe(longer);
     } finally { vi.useRealTimers(); }
   });
 
@@ -17452,6 +17530,9 @@ describe('the goal loop over the bridge', () => {
         await vi.advanceTimersByTimeAsync(60_000);
         await sweepStaleSwarm(Date.now());
         expect(await repairFor(), `no reload inside the limit (minute ${minute + 1})`).toBeUndefined();
+        expect(goal.goalPendingReplyFor(chat)?.pickupAttempts ?? 0).toBe(0);
+        const pageRecovery = (await request('GET', `/activity?conversationId=${chat}&loadRecovery=1`)).body;
+        expect(pageRecovery).toEqual({ pending: true, retryAt });
         expect(goal.goalPendingReplyFor(chat)?.pickupAttempts ?? 0).toBe(0);
       }
       // The wait is logged once for the hold, not on every pass.

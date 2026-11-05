@@ -142,7 +142,7 @@ interface Hook {
   pullActivity(): Promise<void>;
   activityPullDelay(input: Record<string, boolean>): number;
   currentActivityPullDelay(): number;
-  recoverConversationLoad(now?: number): boolean;
+  recoverConversationLoad(now?: number): Promise<boolean>;
   notePresentation(messageId: string, text: string, now?: number): boolean;
   presentationPending(now?: number): boolean;
   runCommand(): Promise<void>;
@@ -13473,10 +13473,113 @@ describe('evidence from the page context', () => {
     expect(emitted(live.sent, 'chat_error').at(-1)?.event.retryAt).toBe(observedAt + 31_000);
   });
 
+  it('never retries an idle conversation load failure until app-owned work arrives', async () => {
+    let pending = false;
+    live = await harness(undefined, { load_failure: () => ({ ok: true, data: { pending, retryAt: null } }) });
+    const retry = live.document.createElement('button');
+    const click = vi.fn();
+    retry.addEventListener('click', click);
+    live.window.CLF_DOM.conversationLoadFailure = () => retry;
+    const now = live.window.Date.now();
+    expect(await live.hook.recoverConversationLoad(now)).toBe(false);
+    expect(await live.hook.recoverConversationLoad(now + 5_001)).toBe(false);
+    expect(await live.hook.recoverConversationLoad(now + 60 * 60_000)).toBe(false);
+    expect(click).not.toHaveBeenCalled();
+    pending = true;
+    expect(await live.hook.recoverConversationLoad(now + 60 * 60_000 + 30_001)).toBe(true);
+    expect(click).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves ordinary load retry backoff through a document reload', async () => {
+    const reply = { load_failure: () => ({ ok: true, data: { pending: true, retryAt: null } }) };
+    live = await harness(undefined, reply);
+    const retry = live.document.createElement('button');
+    live.window.CLF_DOM.conversationLoadFailure = () => retry;
+    const now = live.window.Date.now();
+    await live.hook.recoverConversationLoad(now);
+    expect(await live.hook.recoverConversationLoad(now + 5_001)).toBe(true);
+    const saved = Object.fromEntries(Object.keys(live.window.sessionStorage).map(key => [key, live!.window.sessionStorage.getItem(key)!]));
+    const reloaded = await harness(undefined, reply, (_document, dom) => {
+      for (const [key, value] of Object.entries(saved)) dom.window.sessionStorage.setItem(key, value);
+    });
+    const nextRetry = reloaded.document.createElement('button');
+    reloaded.window.CLF_DOM.conversationLoadFailure = () => nextRetry;
+    expect(await reloaded.hook.recoverConversationLoad(now + 6_000)).toBe(false);
+    expect(await reloaded.hook.recoverConversationLoad(now + 11_001)).toBe(false);
+    expect(await reloaded.hook.recoverConversationLoad(now + 26_002)).toBe(true);
+    reloaded.close();
+  });
+
+  it('keeps a working conversation recoverable after the bridge provider hold', async () => {
+    let retryAt = 0;
+    live = await harness(undefined, { load_failure: () => ({ ok: true, data: { pending: true, retryAt } }) });
+    const retry = live.document.createElement('button');
+    const click = vi.fn();
+    retry.addEventListener('click', click);
+    live.window.CLF_DOM.conversationLoadFailure = () => retry;
+    const now = live.window.Date.now();
+    retryAt = now + 120_000;
+    await live.hook.recoverConversationLoad(now);
+    expect(await live.hook.recoverConversationLoad(now + 5_001)).toBe(false);
+    expect(await live.hook.recoverConversationLoad(now + 119_999)).toBe(false);
+    expect(click).not.toHaveBeenCalled();
+    expect(await live.hook.recoverConversationLoad(now + 120_001)).toBe(true);
+    expect(click).toHaveBeenCalledTimes(1);
+  });
+
+  function loadRecoveryHarness(...args: Parameters<typeof harness>): Promise<Harness> {
+    const [url, replies, before, nonPro, deadline] = args;
+    return harness(url, { load_failure: () => ({ ok: true, data: { pending: true, retryAt: null } }), ...replies }, before, nonPro, deadline);
+  }
+
+  it('retains a bridge hold across reload even beyond the backoff step lifetime', async () => {
+    const now = Date.now();
+    const retryAt = now + 3 * 60 * 60_000;
+    const key = 'clf-history-limit-v1:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    live = await loadRecoveryHarness(undefined, {}, (_document, dom) => {
+      dom.window.sessionStorage.setItem(key, JSON.stringify({ conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+        retries: 3, limited: true, at: now, retryAt }));
+    });
+    const retry = live.document.createElement('button');
+    const click = vi.fn();
+    retry.addEventListener('click', click);
+    live.window.CLF_DOM.conversationLoadFailure = () => retry;
+    expect(await live.hook.recoverConversationLoad(now + 90 * 60_000)).toBe(false);
+    expect(await live.hook.recoverConversationLoad(retryAt - 1)).toBe(false);
+    expect(click).not.toHaveBeenCalled();
+    expect(await live.hook.recoverConversationLoad(retryAt + 1)).toBe(true);
+  });
+
+  it.each(['navigation', 'stop', 'button-changed'])('rejects a late history Retry permission after %s', async change => {
+    let release: (value: unknown) => void = () => undefined;
+    const permission = new Promise(resolve => { release = resolve; });
+    live = await harness(undefined, { load_failure: () => permission });
+    const retry = live.document.createElement('button');
+    const click = vi.fn();
+    retry.addEventListener('click', click);
+    live.window.CLF_DOM.conversationLoadFailure = () => retry;
+    const now = live.window.Date.now();
+    await live.hook.recoverConversationLoad(now);
+    const pending = live.hook.recoverConversationLoad(now + 5_001);
+    await settle();
+    if (change === 'navigation') {
+      live.dom.reconfigure({ url: 'https://chatgpt.com/c/11111111-2222-3333-4444-555555555555' });
+      live.hook.observe();
+    } else if (change === 'button-changed') live.window.CLF_DOM.conversationLoadFailure = () => null;
+    else {
+      const stop = live.document.createElement('button');
+      live.window.CLF_DOM.stopButton = () => stop;
+      live.trustedClick(stop);
+    }
+    release({ ok: true, data: { pending: true, retryAt: null } });
+    expect(await pending).toBe(false);
+    expect(click).not.toHaveBeenCalled();
+  });
+
   it('backs off ChatGPT history Retry after a rate limit instead of pressing it once a minute (2026-10-11)', async () => {
     // Each press after Retry-After drew another 429 with a longer Retry-After, so a press a minute
     // kept the limit alive for half an hour. After a limit the presses spread out: 0 s, 2, 4, 8, 15, 30, 60 min.
-    live = await harness();
+    live = await loadRecoveryHarness();
     const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
     const start = live.window.Date.now();
     let clicks = 0;
@@ -13490,16 +13593,16 @@ describe('evidence from the page context', () => {
     }));
     await settle();
     // The first press still comes when ChatGPT said it may.
-    expect(live.hook.recoverConversationLoad(start + 10_001)).toBe(false);
-    expect(live.hook.recoverConversationLoad(start + 15_002)).toBe(true);
+    expect(await live.hook.recoverConversationLoad(start + 10_001)).toBe(false);
+    expect(await live.hook.recoverConversationLoad(start + 15_002)).toBe(true);
     // The next ones wait two, then four minutes, where a plain load failure would press every minute.
     const first = start + 15_002;
-    expect(live.hook.recoverConversationLoad(first + 65_000)).toBe(false);
-    expect(live.hook.recoverConversationLoad(first + 124_000)).toBe(false);
-    expect(live.hook.recoverConversationLoad(first + 125_001)).toBe(true);
+    expect(await live.hook.recoverConversationLoad(first + 65_000)).toBe(false);
+    expect(await live.hook.recoverConversationLoad(first + 124_000)).toBe(false);
+    expect(await live.hook.recoverConversationLoad(first + 125_001)).toBe(true);
     const second = first + 125_001;
-    expect(live.hook.recoverConversationLoad(second + 125_001)).toBe(false);
-    expect(live.hook.recoverConversationLoad(second + 245_001)).toBe(true);
+    expect(await live.hook.recoverConversationLoad(second + 125_001)).toBe(false);
+    expect(await live.hook.recoverConversationLoad(second + 245_001)).toBe(true);
     expect(clicks).toBe(3);
   });
 
@@ -13522,29 +13625,30 @@ describe('evidence from the page context', () => {
       (page.window as any).CLF_DOM.conversationLoadFailure = () => retry;
       return () => clicks;
     };
-    live = await harness();
+    live = await loadRecoveryHarness();
     const start = live.window.Date.now();
     const firstClicks = failing(live);
     await limitAndPress(live, start + 10_000);
-    expect(live.hook.recoverConversationLoad(start + 10_001)).toBe(false);
-    expect(live.hook.recoverConversationLoad(start + 15_002)).toBe(true);
-    expect(live.hook.recoverConversationLoad(start + 15_002 + 125_001)).toBe(true);
+    expect(await live.hook.recoverConversationLoad(start + 10_001)).toBe(false);
+    expect(await live.hook.recoverConversationLoad(start + 15_002)).toBe(true);
+    expect(await live.hook.recoverConversationLoad(start + 15_002 + 125_001)).toBe(true);
     expect(firstClicks()).toBe(2);
-    const saved = live.window.sessionStorage.getItem('clf-history-limit-v1');
+    const saved = live.window.sessionStorage.getItem('clf-history-limit-v1:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
     expect(saved).not.toBeNull();
 
     // The reloaded page of the same chat waits the next step (4 minutes), not the first one.
     const reloadAt = start + 15_002 + 125_001 + 60_000;
     const seed = (stored: string | null) => (document: Document) => {
-      if (stored !== null) document.defaultView!.sessionStorage.setItem('clf-history-limit-v1', stored);
+      if (stored !== null) document.defaultView!.sessionStorage.setItem('clf-history-limit-v1:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', stored);
     };
-    let reloaded = await harness(undefined, {}, seed(saved));
+    let reloaded = await loadRecoveryHarness(undefined, {}, seed(saved));
     const clicks = failing(reloaded);
     await limitAndPress(reloaded, reloadAt + 10_000);
-    expect(reloaded.hook.recoverConversationLoad(reloadAt + 10_001)).toBe(false);
-    expect(reloaded.hook.recoverConversationLoad(reloadAt + 15_002)).toBe(false);
-    expect(reloaded.hook.recoverConversationLoad(reloadAt + 10_001 + 244_999)).toBe(false);
-    expect(reloaded.hook.recoverConversationLoad(reloadAt + 10_001 + 245_000)).toBe(true);
+    expect(await reloaded.hook.recoverConversationLoad(reloadAt + 10_001)).toBe(false);
+    expect(await reloaded.hook.recoverConversationLoad(reloadAt + 15_002)).toBe(false);
+    const nextPress = start + 15_002 + 125_001 + 245_000;
+    expect(await reloaded.hook.recoverConversationLoad(nextPress - 1)).toBe(false);
+    expect(await reloaded.hook.recoverConversationLoad(nextPress)).toBe(true);
     expect(clicks()).toBe(1);
     reloaded.dom.window.close();
 
@@ -13554,50 +13658,49 @@ describe('evidence from the page context', () => {
       JSON.stringify({ ...JSON.parse(saved!), at: reloadAt - 3 * 60 * 60_000 }),
       '{not json'
     ]) {
-      reloaded = await harness(undefined, {}, seed(stored));
+      reloaded = await loadRecoveryHarness(undefined, {}, seed(stored));
       const fresh = failing(reloaded);
       await limitAndPress(reloaded, reloadAt + 10_000);
-      expect(reloaded.hook.recoverConversationLoad(reloadAt + 10_001)).toBe(false);
-      expect(reloaded.hook.recoverConversationLoad(reloadAt + 15_002)).toBe(true);
+      expect(await reloaded.hook.recoverConversationLoad(reloadAt + 10_001)).toBe(false);
+      expect(await reloaded.hook.recoverConversationLoad(reloadAt + 15_002)).toBe(true);
       expect(fresh()).toBe(1);
       reloaded.dom.window.close();
     }
 
-    // An entry that does not apply to the chat this page shows is removed, so it cannot come back
-    // when the tab returns to its chat later (CodeRabbit on #2072).
-    reloaded = await harness('https://chatgpt.com/c/11111111-2222-3333-4444-555555555555', {}, seed(saved));
+    // Visiting another conversation cannot erase the first conversation's retry deadline.
+    reloaded = await loadRecoveryHarness('https://chatgpt.com/c/11111111-2222-3333-4444-555555555555', {}, seed(saved));
     failing(reloaded);
-    reloaded.hook.recoverConversationLoad(reloadAt);
-    expect(reloaded.window.sessionStorage.getItem('clf-history-limit-v1')).toBeNull();
+    await reloaded.hook.recoverConversationLoad(reloadAt);
+    expect(reloaded.window.sessionStorage.getItem('clf-history-limit-v1:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee')).toBe(saved);
     reloaded.dom.window.close();
 
     // A page that stays open on the limited chat also forgets a step whose last press is more than
     // 75 minutes old, and starts again at the first step.
-    reloaded = await harness(undefined, {}, seed(saved));
+    reloaded = await loadRecoveryHarness(undefined, {}, seed(saved));
     const resumed = failing(reloaded);
     await limitAndPress(reloaded, reloadAt + 10_000);
-    expect(reloaded.hook.recoverConversationLoad(reloadAt + 10_001)).toBe(false);
-    expect(reloaded.hook.recoverConversationLoad(reloadAt + 10_001 + 245_000)).toBe(true);
+    expect(await reloaded.hook.recoverConversationLoad(reloadAt + 10_001)).toBe(false);
+    expect(await reloaded.hook.recoverConversationLoad(reloadAt + 10_001 + 245_000)).toBe(true);
     const lastPress = reloadAt + 10_001 + 245_000;
     const late = lastPress + 75 * 60_000 + 1;
-    expect(reloaded.hook.recoverConversationLoad(late)).toBe(false);
-    expect(reloaded.hook.recoverConversationLoad(late + 5_000)).toBe(true);
+    expect(await reloaded.hook.recoverConversationLoad(late)).toBe(false);
+    expect(await reloaded.hook.recoverConversationLoad(late + 5_000)).toBe(true);
     expect(resumed()).toBe(2);
-    // Until ChatGPT limits it again, the press is an ordinary one and nothing is remembered.
-    expect(reloaded.window.sessionStorage.getItem('clf-history-limit-v1')).toBeNull();
+    // Ordinary failures now retain their retry deadline too.
+    expect(JSON.parse(reloaded.window.sessionStorage.getItem('clf-history-limit-v1:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee')!).limited).toBe(false);
     reloaded.dom.window.close();
 
     // Once the chat loads again, the remembered step is gone.
-    reloaded = await harness(undefined, {}, seed(saved));
+    reloaded = await loadRecoveryHarness(undefined, {}, seed(saved));
     (reloaded.window as any).CLF_DOM.conversationLoadFailure = () => null;
     assistantTurn(reloaded.document, 'loaded-again', []);
-    expect(reloaded.hook.recoverConversationLoad(reloadAt)).toBe(false);
-    expect(reloaded.window.sessionStorage.getItem('clf-history-limit-v1')).toBeNull();
+    expect(await reloaded.hook.recoverConversationLoad(reloadAt)).toBe(false);
+    expect(reloaded.window.sessionStorage.getItem('clf-history-limit-v1:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee')).toBeNull();
     reloaded.dom.window.close();
   });
 
   it('does not press ChatGPT history Retry inside the provider Retry-After window', async () => {
-    live = await harness();
+    live = await loadRecoveryHarness();
     const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
     const now = live.window.Date.now();
     let clicks = 0;
@@ -13612,12 +13715,12 @@ describe('evidence from the page context', () => {
     }));
     await settle();
 
-    expect(live.hook.recoverConversationLoad(now + 6_000)).toBe(false);
-    expect(live.hook.recoverConversationLoad(now + 23_999)).toBe(false);
+    expect(await live.hook.recoverConversationLoad(now + 6_000)).toBe(false);
+    expect(await live.hook.recoverConversationLoad(now + 23_999)).toBe(false);
     expect(clicks).toBe(0);
 
-    expect(live.hook.recoverConversationLoad(now + 24_001)).toBe(false);
-    expect(live.hook.recoverConversationLoad(now + 29_002)).toBe(true);
+    expect(await live.hook.recoverConversationLoad(now + 24_001)).toBe(false);
+    expect(await live.hook.recoverConversationLoad(now + 29_002)).toBe(true);
     expect(clicks).toBe(1);
   });
 

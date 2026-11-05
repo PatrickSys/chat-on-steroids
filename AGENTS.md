@@ -796,9 +796,17 @@ Once a chat's history has been limited, the page's Retry presses after Retry-Aft
 0 s, 2, 4, 8, 15, 30, then 60 minutes (`LOAD_FAILURE_LIMITED_BACKOFF_MS`), instead of the
 once-a-minute pace kept for an ordinary load failure. Measured 2026-10-11: pressing every minute
 drew a new 429 with a longer Retry-After each time. The step reached survives a reload of the same
-chat in that tab (`sessionStorage` key `clf-history-limit-v1`: conversation id, step, time of the
-last press; forgotten after 75 quiet minutes, on another chat, or once the chat's turns render), so
-the app's own reload after each hold no longer restarts the page at 0 s. The app's hold after a
+chat in that tab (`sessionStorage` key `clf-history-limit-v1:<conversationId>`: step, time of the
+last press, ordinary/limited schedule and provider deadline; the step is forgotten after 75 quiet
+minutes or once the chat's turns render, while an unexpired provider hold survives), so
+the app's own reload after each hold no longer restarts the page at 0 s. Ordinary failures retain
+their schedule too; visiting another chat does not erase either deadline. Immediately before a
+press, `load_failure` asks the bridge's read-only `/activity?loadRecovery=1` projection whether this
+exact conversation still has live work, authored input, a compaction, or an owed Goal/Loop pickup.
+An enabled switch or old recorded turn alone grants nothing. The bridge's provider hold and the
+page's Retry-After both fence the press, and document/epoch/Stop checks run again after the reply.
+Idle/refused pages never press Retry; they check locally for newly arrived work at most every
+30 seconds. The projection neither claims nor spends an existing pickup. The app's hold after a
 retry that is limited again uses the same steps (`PROVIDER_HISTORY_STREAK_HOLDS_MS`), and "Try now"
 is refused while it lasts. Measured 2026-11-05 (#1882): a chat limited for 8.5 hours took 23
 quarter-hour rounds, each a reload plus presses after 0, 2 and 4 minutes. The recorder writes a repeating history-limit notice (one

@@ -13958,7 +13958,8 @@ describe('evidence from the page context', () => {
     expect(live.hook.recoverConversationLoad(start + 15_002)).toBe(true);
     expect(live.hook.recoverConversationLoad(start + 15_002 + 125_001)).toBe(true);
     expect(firstClicks()).toBe(2);
-    const saved = live.window.sessionStorage.getItem('clf-history-limit-v1');
+    const storageKey = `clf-history-limit-v1:${conversationId}`;
+    const saved = live.window.sessionStorage.getItem(storageKey);
     expect(saved).not.toBeNull();
 
     // The reloaded page of the same chat waits the next step (4 minutes), not the first one.
@@ -13979,7 +13980,7 @@ describe('evidence from the page context', () => {
     // A step remembered for another chat, or from long ago, is not carried over.
     for (const stored of [
       JSON.stringify({ ...JSON.parse(saved!), conversationId: '11111111-2222-3333-4444-555555555555' }),
-      JSON.stringify({ ...JSON.parse(saved!), at: reloadAt - 3 * 60 * 60_000 }),
+      JSON.stringify({ ...JSON.parse(saved!), at: reloadAt - 3 * 60 * 60_000, retryAt: reloadAt - 3 * 60 * 60_000 }),
       '{not json'
     ]) {
       reloaded = await harness(undefined, {}, seed(stored));
@@ -13991,12 +13992,12 @@ describe('evidence from the page context', () => {
       reloaded.dom.window.close();
     }
 
-    // An entry that does not apply to the chat this page shows is removed, so it cannot come back
-    // when the tab returns to its chat later (CodeRabbit on #2072).
+    // Another chat starts fresh without erasing A's legacy state before A can migrate it.
     reloaded = await harness('https://chatgpt.com/c/11111111-2222-3333-4444-555555555555', {}, seed(saved));
     failing(reloaded);
     reloaded.hook.recoverConversationLoad(reloadAt);
-    expect(reloaded.window.sessionStorage.getItem('clf-history-limit-v1')).toBeNull();
+    expect(reloaded.window.sessionStorage.getItem('clf-history-limit-v1')).toBe(saved);
+    expect(reloaded.window.sessionStorage.getItem('clf-history-limit-v1:11111111-2222-3333-4444-555555555555')).toBeNull();
     reloaded.dom.window.close();
 
     // A page that stays open on the limited chat also forgets a step whose last press is more than
@@ -14011,8 +14012,11 @@ describe('evidence from the page context', () => {
     expect(reloaded.hook.recoverConversationLoad(late)).toBe(false);
     expect(reloaded.hook.recoverConversationLoad(late + 5_000)).toBe(true);
     expect(resumed()).toBe(2);
-    // Until ChatGPT limits it again, the press is an ordinary one and nothing is remembered.
+    // The stale limited schedule resets, while the new ordinary schedule is remembered.
     expect(reloaded.window.sessionStorage.getItem('clf-history-limit-v1')).toBeNull();
+    expect(JSON.parse(reloaded.window.sessionStorage.getItem(storageKey) ?? 'null')).toMatchObject({
+      conversationId, retries: 1, limited: false
+    });
     reloaded.dom.window.close();
 
     // Once the chat loads again, the remembered step is gone.
@@ -14021,6 +14025,7 @@ describe('evidence from the page context', () => {
     assistantTurn(reloaded.document, 'loaded-again', []);
     expect(reloaded.hook.recoverConversationLoad(reloadAt)).toBe(false);
     expect(reloaded.window.sessionStorage.getItem('clf-history-limit-v1')).toBeNull();
+    expect(reloaded.window.sessionStorage.getItem(storageKey)).toBeNull();
     reloaded.dom.window.close();
   });
 
@@ -14047,6 +14052,125 @@ describe('evidence from the page context', () => {
     expect(live.hook.recoverConversationLoad(now + 24_001)).toBe(false);
     expect(live.hook.recoverConversationLoad(now + 29_002)).toBe(true);
     expect(clicks).toBe(1);
+  });
+
+  describe('private carry History Retry persistence', () => {
+    const chatA = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const chatB = '11111111-2222-3333-4444-555555555555';
+
+    const grantHistoryRetry = async (page: Harness): Promise<void> => {
+      await settle();
+      page.reply.set('activity', () => ({ ok: true, data: {
+        entries: [], stream: [], nextSince: 0, pendingTools: 0, historyRetry: { wanted: true }
+      } }));
+      await page.hook.pullActivity();
+    };
+
+    const installRetryButton = (page: Harness): (() => number) => {
+      let clicks = 0;
+      const retry = page.document.createElement('button');
+      retry.addEventListener('click', () => { clicks++; });
+      page.document.body.append(retry);
+      (page.window as any).CLF_DOM.conversationLoadFailure = () => retry;
+      return () => clicks;
+    };
+
+    it('preserves ordinary retry backoff through a document reload', async () => {
+      const url = `https://chatgpt.com/c/${chatA}`;
+      live = await harness(url);
+      await grantHistoryRetry(live);
+      const firstClicks = installRetryButton(live);
+      const start = live.window.Date.now();
+
+      expect(live.hook.recoverConversationLoad(start)).toBe(false);
+      expect(live.hook.recoverConversationLoad(start + 5_001)).toBe(true);
+      expect(firstClicks()).toBe(1);
+
+      const saved = Object.fromEntries(Object.keys(live.window.sessionStorage)
+        .map(key => [key, live!.window.sessionStorage.getItem(key)!]));
+      live.close();
+      const seed = (_document: Document, dom: JSDOM): void => {
+        for (const [key, value] of Object.entries(saved)) dom.window.sessionStorage.setItem(key, value);
+      };
+      live = await harness(url, {}, seed);
+      await grantHistoryRetry(live);
+      const nextClicks = installRetryButton(live);
+
+      expect(live.hook.recoverConversationLoad(start + 6_000)).toBe(false);
+      expect(live.hook.recoverConversationLoad(start + 11_001)).toBe(false);
+      expect(nextClicks()).toBe(0);
+      expect(live.hook.recoverConversationLoad(start + 26_002)).toBe(true);
+      expect(nextClicks()).toBe(1);
+    });
+
+    it('keeps limited retry state for A across a fresh B route and back to A', async () => {
+      live = await harness(`https://chatgpt.com/c/${chatA}`);
+      await grantHistoryRetry(live);
+      const clicksA = installRetryButton(live);
+      const start = live.window.Date.now();
+      live.window.dispatchEvent(new live.window.MessageEvent('message', {
+        source: live.window as unknown as Window,
+        origin: 'https://chatgpt.com',
+        data: { type: 'cos-history-rate-limit', conversationId: chatA, observedAt: start, retryAt: start + 5_000 }
+      }));
+      await settle();
+      expect(live.hook.recoverConversationLoad(start + 5_001)).toBe(false);
+      expect(live.hook.recoverConversationLoad(start + 10_002)).toBe(true);
+      expect(clicksA()).toBe(1);
+
+      live.dom.reconfigure({ url: `https://chatgpt.com/c/${chatB}` });
+      live.hook.observe();
+      await settle();
+      await grantHistoryRetry(live);
+      const clicksB = installRetryButton(live);
+      expect(live.hook.recoverConversationLoad(start + 11_000)).toBe(false);
+      expect(live.hook.recoverConversationLoad(start + 16_001)).toBe(true);
+      expect(clicksB()).toBe(1);
+
+      live.dom.reconfigure({ url: `https://chatgpt.com/c/${chatA}` });
+      live.hook.observe();
+      await settle();
+      await grantHistoryRetry(live);
+      const returnedClicksA = installRetryButton(live);
+      expect(live.hook.recoverConversationLoad(start + 17_000)).toBe(false);
+      expect(live.hook.recoverConversationLoad(start + 23_001)).toBe(false);
+      expect(returnedClicksA()).toBe(0);
+    });
+
+    it('honors a persisted provider deadline after the activity grant goes stale', async () => {
+      const url = `https://chatgpt.com/c/${chatA}`;
+      live = await harness(url);
+      await grantHistoryRetry(live);
+      const start = live.window.Date.now();
+      const retryAt = start + 3 * 60 * 60_000;
+      live.window.dispatchEvent(new live.window.MessageEvent('message', {
+        source: live.window as unknown as Window,
+        origin: 'https://chatgpt.com',
+        data: { type: 'cos-history-rate-limit', conversationId: chatA, observedAt: start, retryAt }
+      }));
+      await settle();
+      installRetryButton(live);
+      expect(live.hook.recoverConversationLoad(start)).toBe(false);
+      const saved = Object.fromEntries(Object.keys(live.window.sessionStorage)
+        .map(key => [key, live!.window.sessionStorage.getItem(key)!]));
+      live.close();
+      const seed = (_document: Document, dom: JSDOM): void => {
+        for (const [key, value] of Object.entries(saved)) dom.window.sessionStorage.setItem(key, value);
+      };
+      live = await harness(url, {}, seed);
+      await grantHistoryRetry(live);
+      const clicks = installRetryButton(live);
+
+      expect(live.hook.recoverConversationLoad(start + 90 * 60_000)).toBe(false);
+      expect(live.hook.recoverConversationLoad(retryAt - 1)).toBe(false);
+      expect(clicks()).toBe(0);
+      expect(live.hook.recoverConversationLoad(retryAt + 1)).toBe(true);
+      expect(clicks()).toBe(1);
+      expect(live.hook.recoverConversationLoad(retryAt + 20_002)).toBe(false);
+      expect(clicks()).toBe(1);
+      expect(live.hook.recoverConversationLoad(retryAt + 125_002)).toBe(true);
+      expect(clicks()).toBe(2);
+    });
   });
 
   it('does not let a stale owned Fiber turn bypass a rejected live ownership handshake', async () => {
@@ -25633,6 +25757,9 @@ describe('ordinary Continue native recovery', () => {
       const result = await live.runtimeMessage({ type: 'clf-repair-commit', conversationId: chat,
         token: 'claimed-native-repair', expected });
       expect(result).toMatchObject(scenario === 'current' ? { dispatched: true } : { safe: false });
+      if (scenario !== 'current' && scenario !== 'denied' && scenario !== 'legacy-native')
+        expect(result).toMatchObject({ committed: true });
+      if (scenario === 'denied' || scenario === 'legacy-native') expect(result).not.toHaveProperty('committed');
       expect(navigations).toBe(scenario === 'current' ? 1 : 0);
       expect(live.sent.filter(message => message.type === 'repair_commit')).toHaveLength(1);
     });

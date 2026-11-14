@@ -3583,10 +3583,13 @@ automatic Continue (<why>); sending it as an ordinary message …`. The session 
 `session:changed` with its outbox write, a Goal reply's stop pushes from the pickup sweep as soon as
 it is recorded (before, and whether or not, its last reload is queued), and a
 user acting on it (sending or cancelling the input; a newer question over a Goal reply) clears it. Native-busy polls do not postpone that schedule. A silence episode retiring
+cannot delete a new pickup repair belonging to its durable ticket.
+
 A known no-action Goal/queue pickup failure finishes the attempt already reserved by its
 durable owner. Its next deadline and remaining budget still apply; an explicit pre-action
 authority deferral does not spend an attempt. Never requeue a known failed handout directly.
-cannot delete a new pickup repair belonging to its durable ticket.
+Native commitment spends that exact handout even if dispatch fails or its response is lost;
+finish it without refunding its authority or offering an immediate replacement.
 
 Continue text, source question/work, busy deadline and exclusive send custody live in the
 outbox. One combination of ten Continue phrases and ten notices is frozen once; notices ask

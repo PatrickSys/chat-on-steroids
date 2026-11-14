@@ -100,7 +100,7 @@
   "privateCarry": {
     "schema": 1,
     "id": "patrick-carry-20261105",
-    "upstream": "a552685cfe6427e5424b198c921f09133b7de4c6",
+    "upstream": "dac3387f6109aa1a62ab9228798d8da6594212af",
     "fixes": [
       "history-retry",
       "approval-safe",

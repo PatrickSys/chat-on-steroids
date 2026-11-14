@@ -12827,7 +12827,7 @@ describe('unattributed activity recovery', () => {
         expect(reload).toHaveBeenCalledTimes(state === 'current' || state === 'lost-response' ? 1 : 0);
         expect(create).not.toHaveBeenCalled();
         expect(receipts).toBe(state === 'current' ? 1 : 0);
-        if (state === 'page-progress' || state === 'inspection-error') {
+        if (state === 'inspection-error') {
           expect(getLog().some(entry => entry.message.includes('recovery deferred before any browser action'))).toBe(true);
           const next = await maintenance();
           expect(next, JSON.stringify(getLog().slice(-8))).toMatchObject({ conversationId: PRIME, reason });
@@ -12839,6 +12839,16 @@ describe('unattributed activity recovery', () => {
           expect((await request('POST', '/repairs/claim', { body: replacement })).body)
             .toMatchObject({ allowed: true, committed: true });
           expect((await request('POST', '/repairs/claim', { body: replacement })).body.allowed).toBe(false);
+        }
+        if (state === 'page-progress') {
+          // The native commit was spent before the page's final veto. This handout finishes;
+          // it cannot refund its authority or mint an immediate replacement attempt.
+          expect(getLog().some(entry => entry.message.includes(`browser reported failed ${reason} recovery`))).toBe(true);
+          expect((await request('POST', '/repairs/claim', { body: { token: handout!.token,
+            conversationId: PRIME, validate: true, commit: true } })).body.allowed).toBe(false);
+          expect(await maintenance()).toBeNull();
+          await repair([handout], {});
+          expect(reload).not.toHaveBeenCalled();
         }
         if (state === 'lost-response') {
           expect((await request('POST', '/repairs/claim', { body: { token: handout!.token,
@@ -15246,12 +15256,18 @@ describe('unattributed activity recovery', () => {
         .filter(event => event.kind === 'progress' && event.progressId === 'loop-stalled:no-tool-turn');
       // An apparent final with the same stable id can still belong to the running turn.
       expect(await diagnostics()).toHaveLength(0);
+      await recordProgress(session.id, 'unrelated-before-loop-notice', 'An unrelated progress update.');
       const completed = await events(chat, [...(splitEnd ? [] : [answer]), endTurn('no-tool-turn', outcome)]);
       expect(completed.status).toBe(200);
       if (diagnosticFailure) expect(goal.snapshotGoalReplies().replies).toContainEqual(
         expect.objectContaining({ conversationId: chat, replyId: 'stable-answer', state: 'handled' }));
       const rows = await diagnostics();
       expect(rows).toHaveLength(outcome === 'completed' && !finishOnly && !diagnosticFailure ? 1 : 0);
+      if (rows.length) {
+        await recordProgress(session.id, 'unrelated-after-loop-notice', 'A newer unrelated progress update.');
+        expect(await readRecentEvents(session.id, 1, { kinds: ['progress'],
+          acceptEvent: event => event.kind === 'progress' && event.progressId === 'loop-stalled:no-tool-turn' })).toEqual(rows);
+      }
       if (outcome === 'completed' && !finishOnly && !diagnosticFailure) expect(rows[0]).toMatchObject({ source: 'app', turnId: 'no-tool-turn',
         message: { text: expect.stringContaining('no local tool call was recorded for it') } });
       expect(goalPendingReplyFor(chat)).toBeNull();

@@ -4011,7 +4011,12 @@ async function performBrowserRepairs(repairs, policy) {
           await call(`/status?repaired=${encodeURIComponent(token)}&repairAction=${repairAction}`);
         } else if (result?.safe === false && result.why !== 'error') {
           const detail = result.why === 'changed' ? repairChangeDetail(result) : result.why || 'unknown';
-          await call(`/status?repairFailed=${encodeURIComponent(token)}&repairAction=${repairAction}&why=deferred&detail=${encodeURIComponent(detail)}`);
+          const why = result.committed === true ? 'changed' : 'deferred';
+          await call(`/status?repairFailed=${encodeURIComponent(token)}&repairAction=${repairAction}&why=${why}&detail=${encodeURIComponent(detail)}`);
+        } else {
+          // Dispatch may have crossed into the page before its response was lost. Finish this
+          // handout without claiming an unproved reload or trying the committed action twice.
+          await call(`/status?repairFailed=${encodeURIComponent(token)}&repairAction=${repairAction}&why=error`);
         }
         continue;
       }
@@ -4032,7 +4037,10 @@ async function performBrowserRepairs(repairs, policy) {
           await call(`/status?repairFailed=${encodeURIComponent(token)}&repairAction=${repairAction}&why=deferred`);
           continue;
         }
-        if (target && (tabDocuments[String(target.id)] !== documentId || tabEpochs[String(target.id)] !== navigationEpoch)) continue;
+        if (target && (tabDocuments[String(target.id)] !== documentId || tabEpochs[String(target.id)] !== navigationEpoch)) {
+          await call(`/status?repairFailed=${encodeURIComponent(token)}&repairAction=${repairAction}&why=changed&detail=new-document`);
+          continue;
+        }
       }
       if (target) await chrome.tabs.reload(target.id);
       else {
@@ -5034,7 +5042,7 @@ const HANDLERS = {
     const result = await call('/repairs/claim', { method: 'POST', body: JSON.stringify({
       token: message.token, conversationId: message.conversationId, validate: true, commit: true
     }) });
-    return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
+    return ownsDocument(source) ? result : { ...result, ok: false, error: 'stale_document' };
   },
   /** Repair both sides of the reader protocol in this exact browser document. */
   async repair_fiber(_message, _sender, source) {

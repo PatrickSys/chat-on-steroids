@@ -160,6 +160,68 @@ it('keeps another chat advance when acceptance persistence fails and accepts the
   } finally { fail(); await rejected; spy.mockRestore(); }
 });
 
+it('keeps objective retirement after a racing acceptance write fails without blocking the chat queue', async () => {
+  const conversationId = 'retirement-racing-acceptance';
+  const session = await createSession({ conversationId });
+  await goal.acceptGoalReplyNow({ conversationId, sessionId: session.id,
+    replyId: 'accepted-a', turnId: 'turn-a', eventSeq: 1, blocked: false });
+
+  const durable = await import('../src/main/durable.js');
+  const write = durable.writeDurableNow;
+  let entered!: () => void, fail!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { fail = resolve; });
+  const spy = vi.spyOn(durable, 'writeDurableNow').mockImplementationOnce(async () => {
+    entered(); await gate; throw new Error('racing acceptance write failed');
+  }).mockImplementation(write);
+
+  const accepting = goal.acceptGoalReplyNow({ conversationId, sessionId: session.id,
+    replyId: 'uncommitted-b', turnId: 'turn-b', eventSeq: 2, blocked: false });
+  const rejected = expect(accepting).rejects.toThrow('racing acceptance write failed');
+  let retiring!: Promise<void>;
+  try {
+    await started;
+    retiring = goal.retireGoalReplyForObjectiveNow(conversationId);
+    fail();
+    await rejected;
+    await expect(retiring).resolves.toBeUndefined();
+
+    const retired = goal.snapshotGoalReplies().replies.find(row => row.conversationId === conversationId);
+    expect(retired).toMatchObject({ replyId: 'accepted-a', turnId: 'turn-a', staleObjective: true, state: 'handled' });
+    await durable.flushDurable();
+    const saved = await durable.readDurable<ReturnType<typeof goal.snapshotGoalReplies>>(goal.GOAL_REPLIES_STATE);
+    expect(saved?.replies.find(row => row.conversationId === conversationId)).toMatchObject({
+      replyId: 'accepted-a', turnId: 'turn-a', staleObjective: true, state: 'handled'
+    });
+  } finally {
+    fail();
+    await rejected;
+    if (retiring) await retiring;
+    spy.mockRestore();
+  }
+});
+
+it('does not let a late retired A reply displace genuine B', async () => {
+  const conversationId = 'retirement-late-reply';
+  const session = await createSession({ conversationId });
+  await goal.acceptGoalReplyNow({ conversationId, sessionId: session.id,
+    replyId: 'reply-a', turnId: 'turn-a', eventSeq: 1, blocked: false });
+
+  await goal.retireGoalReplyForObjectiveNow(conversationId);
+  expect(goal.snapshotGoalReplies().replies.find(row => row.conversationId === conversationId))
+    .toMatchObject({ replyId: 'reply-a', staleObjective: true, state: 'handled' });
+
+  await goal.acceptGoalReplyNow({ conversationId, sessionId: session.id,
+    replyId: 'reply-b', turnId: 'turn-b', eventSeq: 2, blocked: false });
+  const genuineB = goal.snapshotGoalReplies().replies.find(row => row.conversationId === conversationId);
+  expect(genuineB).toMatchObject({ replyId: 'reply-b', turnId: 'turn-b', staleTurnId: 'turn-a' });
+
+  await goal.acceptGoalReplyNow({ conversationId, sessionId: session.id,
+    replyId: 'late-a', turnId: 'turn-a', eventSeq: 99, blocked: false });
+  expect(goal.snapshotGoalReplies().replies.find(row => row.conversationId === conversationId))
+    .toEqual(genuineB);
+});
+
 it.each(['null', 'throw', 'warn-throws'] as const)('accepts a completed Loop reply when diagnostic recording returns %s', async failure => {
   const conversationId = 'loop-diagnostic-failure';
   const session = await createSession({ conversationId });

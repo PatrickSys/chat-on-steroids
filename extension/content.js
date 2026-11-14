@@ -12817,7 +12817,8 @@
    */
   const LOAD_FAILURE_LIMITED_BACKOFF_MS = [0, 120_000, 240_000, 480_000, 900_000, 1_800_000, 3_600_000];
   /*
-   * The step reached survives a reload of the same chat in this tab. The app reloads a limited
+   * Both schedules and provider deadlines survive reloads, separately for each chat in this tab.
+   * The app reloads a limited
    * chat after each of its holds, and a fresh page used to start again at the first step: every
    * reload came with presses after 0, 2 and 4 minutes, 23 rounds in 8.5 hours (#1882,
    * 2026-11-05). A step older than the longest one plus a quarter hour is forgotten, the same
@@ -12832,6 +12833,8 @@
   let loadFailureToldAt = 0;
   let loadFailureStored = false;
   let loadFailureLastPress = 0;
+  let loadFailureRetryAt = 0;
+  const loadFailureStorageKey = route => `${LOAD_FAILURE_LIMITED_STORAGE}:${route}`;
   /** How long the app's word holds without a newer activity reply. */
   const APP_HISTORY_RETRY_FRESH_MS = 2 * 60_000;
   /** How long a newly shown chat waits for the app's first answer before the page's own rule applies. */
@@ -12864,20 +12867,23 @@
   }
   function restoreLimitedLoadFailure(route, now) {
     try {
-      const raw = sessionStorage.getItem(LOAD_FAILURE_LIMITED_STORAGE);
+      if (!route) return;
+      const raw = sessionStorage.getItem(loadFailureStorageKey(route)) ?? sessionStorage.getItem(LOAD_FAILURE_LIMITED_STORAGE);
       if (raw === null) return;
       loadFailureStored = true;
       const saved = raw.length <= 512 ? JSON.parse(raw) : null;
+      const hold = saved && Number.isFinite(saved.retryAt) && saved.retryAt > 0 &&
+        saved.retryAt - now <= 24 * 60 * 60_000 ? saved.retryAt : 0;
       if (saved && typeof saved === 'object' && route && saved.conversationId === route &&
-          Number.isInteger(saved.retries) && saved.retries > 0 && saved.retries <= 1000 &&
-          Number.isFinite(saved.at) && saved.at <= now && now - saved.at <= LOAD_FAILURE_LIMITED_MEMORY_MS) {
+          Number.isInteger(saved.retries) && saved.retries >= 0 && saved.retries <= 1000 &&
+          Number.isFinite(saved.at) && saved.at <= now && now - Math.max(saved.at, hold) <= LOAD_FAILURE_LIMITED_MEMORY_MS) {
         loadFailureRetries = saved.retries;
-        loadFailureLimited = true;
+        loadFailureLimited = saved.limited !== false;
         loadFailureLastPress = saved.at;
+        loadFailureRetryAt = hold;
       } else if (route) {
-        // Another chat's, an expired or a damaged entry: removed, so it cannot come back when the
-        // tab returns to its chat later. A page between routes keeps it.
-        sessionStorage.removeItem(LOAD_FAILURE_LIMITED_STORAGE);
+        sessionStorage.removeItem(loadFailureStorageKey(route));
+        if (saved?.conversationId === route) sessionStorage.removeItem(LOAD_FAILURE_LIMITED_STORAGE);
         loadFailureStored = false;
       }
     } catch {
@@ -12886,14 +12892,17 @@
   }
   function rememberLimitedLoadFailure(route, now) {
     try {
-      if (loadFailureLimited && route) {
-        sessionStorage.setItem(LOAD_FAILURE_LIMITED_STORAGE,
-          JSON.stringify({ conversationId: route, retries: loadFailureRetries, at: now }));
+      if (!route) return;
+      if (loadFailureRetries > 0 || loadFailureRetryAt > now) {
+        sessionStorage.setItem(loadFailureStorageKey(route), JSON.stringify({ conversationId: route,
+          retries: loadFailureRetries, limited: loadFailureLimited, at: loadFailureLastPress || now, retryAt: loadFailureRetryAt }));
         loadFailureStored = true;
       } else if (loadFailureStored) {
-        sessionStorage.removeItem(LOAD_FAILURE_LIMITED_STORAGE);
+        sessionStorage.removeItem(loadFailureStorageKey(route));
         loadFailureStored = false;
       }
+      const legacy = sessionStorage.getItem(LOAD_FAILURE_LIMITED_STORAGE);
+      if (legacy && JSON.parse(legacy)?.conversationId === route) sessionStorage.removeItem(LOAD_FAILURE_LIMITED_STORAGE);
     } catch {
       // This document still keeps its own step.
     }
@@ -12907,6 +12916,8 @@
       loadFailureRetries = 0;
       loadFailureLimited = false;
       loadFailureLastPress = 0;
+      loadFailureRetryAt = 0;
+      loadFailureStored = false;
       historyRouteSince = now;
       restoreLimitedLoadFailure(route, now);
     }
@@ -12916,6 +12927,8 @@
     // established settle/backoff logic below resumes unchanged.
     if (pendingHistoryRateLimit?.conversationId === route) {
       loadFailureLimited = true;
+      loadFailureRetryAt = Math.max(loadFailureRetryAt, pendingHistoryRateLimit.retryAt);
+      rememberLimitedLoadFailure(route, now);
       if (pendingHistoryRateLimit.retryAt > now) return false;
       pendingHistoryRateLimit = null;
     }
@@ -12925,6 +12938,7 @@
       if (CLF_DOM.turns().length) {
         loadFailureRetries = 0;
         loadFailureLimited = false;
+        loadFailureRetryAt = 0;
         if (loadFailureStored) rememberLimitedLoadFailure(route, now);
       }
       return false;
@@ -12935,9 +12949,9 @@
       loadFailureToldAt = now;
       void ask({ type: 'load_failure', conversationId: route }).catch(() => undefined);
     }
-    // A page that stayed open on this chat forgets a step whose last press is as old as a stored
-    // one would be, and starts over, the same as after a reload.
-    if (loadFailureLastPress && now - loadFailureLastPress > LOAD_FAILURE_LIMITED_MEMORY_MS) {
+    // A provider hold keeps its limited ladder through the deadline. The same memory window
+    // follows that deadline or the latest press, both here and after a document reload.
+    if (loadFailureLastPress && now - Math.max(loadFailureLastPress, loadFailureRetryAt) > LOAD_FAILURE_LIMITED_MEMORY_MS) {
       loadFailureRetries = 0;
       loadFailureLimited = false;
       loadFailureLastPress = 0;
@@ -12947,12 +12961,12 @@
     if (!loadFailureSince) loadFailureSince = now;
     const schedule = loadFailureLimited ? LOAD_FAILURE_LIMITED_BACKOFF_MS : LOAD_FAILURE_BACKOFF_MS;
     const wait = LOAD_FAILURE_SETTLE_MS + schedule[Math.min(loadFailureRetries, schedule.length - 1)];
-    if (now - loadFailureSince < wait) return false;
+    if (now - loadFailureSince < wait || now < loadFailureRetryAt) return false;
     if (!appAllowsHistoryRetry(route, now)) return false;
     loadFailureRetries++;
     loadFailureSince = now;
     loadFailureLastPress = now;
-    if (loadFailureLimited) rememberLimitedLoadFailure(route, now);
+    rememberLimitedLoadFailure(route, now);
     retry.click();
     return true;
   }
@@ -13563,11 +13577,12 @@
     if (checked.safe !== true) return checked;
     const permission = await ask({ type: 'repair_commit', conversationId: target, token: message.token });
     if (!permission?.ok || permission.data?.allowed !== true || permission.data?.committed !== true)
-      return { safe: false, why: 'deferred' };
+      return permission?.data?.committed === true ? { safe: false, why: 'page-changed', committed: true }
+        : { safe: false, why: 'deferred' };
     // Native permission commits the action. No awaited page probe may follow it:
     // this document owns both the final progress/draft/Stop check and navigation.
     const current = repairPageVerdict({ ...message, expected: message.expected || checked }, target, forEpoch);
-    if (current.safe !== true) return current;
+    if (current.safe !== true) return { ...current, committed: true };
     location.reload();
     return { dispatched: true };
   }

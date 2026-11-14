@@ -11724,7 +11724,8 @@ async function failRepairAttempt(
     // ChatGPT recovered by itself and is answering: the page keeps the reload for after the answer
     // instead of ending it. Nothing failed, so it is neither a warning nor a "Reload failed" row.
     const streaming = why === 'streaming';
-    const deferred = why === 'deferred';
+    const committed = repair.committedToken === token;
+    const deferred = why === 'deferred' && !committed;
     const hold = changeDetail === 'inspection-error' ? 'page inspection failed before commit'
       : changeDetail && Object.hasOwn(REPAIR_HOLD_REASONS, changeDetail) ? REPAIR_HOLD_REASONS[changeDetail]
       : repairChangeDetail(changeDetail) ?? 'app authority changed';
@@ -11757,7 +11758,7 @@ async function failRepairAttempt(
         ? `Browser recovery deferred before any browser action; ${hold}.`
         : streaming
         ? repair.attribution ? 'Not reloaded: ChatGPT is answering.' : 'ChatGPT is answering again; recovery waits until it finishes.'
-        : `${action === 'reopened' ? 'Reopen' : action === 'resumed' ? 'Resume' : 'Reload'} failed while ${repairPurpose(repair).during}${repair.attribution ? '.' : '; will retry.'}`
+        : `${action === 'reopened' ? 'Reopen' : action === 'resumed' ? 'Resume' : 'Reload'} failed while ${repairPurpose(repair).during}${repair.attribution || committed ? '.' : '; will retry.'}`
     );
     if (repairsInFlight.get(conversationId) !== repair) return;
     // A reported attempt still spends the attribution pass, even if Chrome failed.
@@ -11770,10 +11771,11 @@ async function failRepairAttempt(
       // Navigation is transient; keep the same repair episode and retry after the short navigation cooldown.
       repair.notBefore = Math.max(repair.notBefore, Date.now() + NAVIGATION_RECOVERY_COOLDOWN_MS);
     }
+    // Native commitment spends this exact handout even if dispatch failed or its response was lost.
     // Goal/queue pickup attempts were reserved in their durable owner. A known
     // no-action failure finishes that attempt; the next action belongs to its
     // persisted deadline/budget. A pre-action authority deferral still spends none.
-    if (!deferred && ((repair.reason === 'unattributed' && !heldByApproval) || repair.reason === 'goal')) repair.state = 'done';
+    if (committed || (!deferred && ((repair.reason === 'unattributed' && !heldByApproval) || repair.reason === 'goal'))) repair.state = 'done';
     else {
       repair.state = 'queued';
       repair.claimed = false;

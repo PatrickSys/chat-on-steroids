@@ -691,15 +691,18 @@ export async function syncGoalPickupRecoveryNow(conversationId: string, replyId:
   return true;
 }
 
-const goalReplyAccepts = new Map<string, Promise<void>>();
+const goalReplyWrites = new Map<string, Promise<void>>();
+function queueGoalReplyWrite(conversationId: string, change: () => Promise<void>): Promise<void> {
+  const write = (goalReplyWrites.get(conversationId) ?? Promise.resolve()).then(change);
+  const tail = write.catch(() => {}).finally(() => {
+    if (goalReplyWrites.get(conversationId) === tail) goalReplyWrites.delete(conversationId);
+  });
+  goalReplyWrites.set(conversationId, tail);
+  return write;
+}
 /** Freeze eligibility and its diagnostic together for one conversation. */
 export function acceptGoalReplyNow(input: Parameters<typeof acceptGoalReply>[0]): Promise<void> {
-  const write = (goalReplyAccepts.get(input.conversationId) ?? Promise.resolve()).then(() => acceptGoalReply(input));
-  const tail = write.catch(() => {}).finally(() => {
-    if (goalReplyAccepts.get(input.conversationId) === tail) goalReplyAccepts.delete(input.conversationId);
-  });
-  goalReplyAccepts.set(input.conversationId, tail);
-  return write;
+  return queueGoalReplyWrite(input.conversationId, () => acceptGoalReply(input));
 }
 
 async function acceptGoalReply(input: {
@@ -1672,22 +1675,24 @@ export async function setGoalReplyActiveNow(conversationId: string, active: bool
   return true;
 }
 
-export async function retireGoalReplyForObjectiveNow(conversationId: string,
+export function retireGoalReplyForObjectiveNow(conversationId: string,
   inFlight?: { sessionId: string; turnId: string }): Promise<void> {
-  const reply = goalReplies.get(conversationId);
-  if (reply) {
-    reply.staleObjective = true;
-    if (inFlight && reply.turnId !== inFlight.turnId) reply.staleTurnId = inFlight.turnId.slice(0, 200);
-  } else if (inFlight) {
-    // This is the existing reply ledger's handled provisional turn, not a second
-    // objective/epoch owner. A stable final later upgrades the same tombstone.
-    goalReplies.set(conversationId, {
-      conversationId, sessionId: inFlight.sessionId,
-      replyId: `turn:${inFlight.turnId}`.slice(0, 200), turnId: inFlight.turnId.slice(0, 200),
-      eventSeq: 0, acceptedAt: Date.now(), state: 'handled', staleObjective: true
-    });
-  }
-  await setGoalReplyActiveNow(conversationId, false);
+  return queueGoalReplyWrite(conversationId, async () => {
+    const reply = goalReplies.get(conversationId);
+    if (reply) {
+      goalReplies.set(conversationId, { ...reply, staleObjective: true,
+        ...(inFlight && reply.turnId !== inFlight.turnId ? { staleTurnId: inFlight.turnId.slice(0, 200) } : {}) });
+    } else if (inFlight) {
+      // This is the existing reply ledger's handled provisional turn, not a second
+      // objective/epoch owner. A stable final later upgrades the same tombstone.
+      goalReplies.set(conversationId, {
+        conversationId, sessionId: inFlight.sessionId,
+        replyId: `turn:${inFlight.turnId}`.slice(0, 200), turnId: inFlight.turnId.slice(0, 200),
+        eventSeq: 0, acceptedAt: Date.now(), state: 'handled', staleObjective: true
+      });
+    }
+    await setGoalReplyActiveNow(conversationId, false);
+  });
 }
 
 /** A fabricated silence reply is not a final answer that a later On may re-arm. */

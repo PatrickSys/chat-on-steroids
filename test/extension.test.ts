@@ -490,7 +490,7 @@ interface WorkerHarness {
   tabsCreate: ReturnType<typeof vi.fn>;
   tabsQuery: ReturnType<typeof vi.fn>;
   tabsUpdate: ReturnType<typeof vi.fn>;
-  tabsSendMessage: ReturnType<typeof vi.fn>;
+  tabsSendMessage: ReturnType<typeof vi.fn<(tabId: number, message: Record<string, unknown>, target?: { documentId?: string }) => Promise<unknown>>>;
   tabsRemove: ReturnType<typeof vi.fn>;
   tabsReload: ReturnType<typeof vi.fn>;
   windowsUpdate: ReturnType<typeof vi.fn>;
@@ -575,7 +575,12 @@ function loadWorker(options: {
         return result;
       }
     });
-    return commit(message);
+    try {
+      return await commit(message);
+    } catch {
+      // Match the shipped clf-repair-commit listener's response when the page action throws.
+      return { safe: false, why: 'error' };
+    }
   });
   const tabsRemove = vi.fn(async () => undefined);
   const tabsReload = vi.fn(async (_id: number) => undefined);
@@ -1774,6 +1779,134 @@ describe('exact chat recovery from a fresh Chrome tab scan', () => {
       expect(worker.tabsCreate).not.toHaveBeenCalled();
       expect(receipts).toBe(0);
     });
+
+  describe('settles a committed browser repair', () => {
+    const repaired: string[] = [];
+    type Failure = { token: string | null; why: string | null };
+    let failures: Failure[];
+    let armed: boolean;
+    let handed: boolean;
+    let worker: WorkerHarness;
+
+    function fixture(options: {
+      pageReply?: (tabId: number, message: Record<string, unknown>) => Promise<unknown>;
+      onClaim?: (body: Record<string, unknown>) => Promise<ReturnType<typeof response>>;
+    } = {}) {
+      armed = false;
+      handed = false;
+      repaired.length = 0;
+      failures = [];
+      const fetch = vi.fn(async (input: string, init?: Record<string, unknown>) => {
+        const url = new URL(input);
+        if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+        if (url.pathname === '/repairs/claim')
+          return options.onClaim ? options.onClaim(JSON.parse(String(init?.body))) : response(200, { allowed: true, committed: true });
+        if (url.pathname === '/status') {
+          if (url.searchParams.has('repaired')) repaired.push(url.searchParams.get('repairAction') || '');
+          if (url.searchParams.has('repairFailed')) failures.push({
+            token: url.searchParams.get('repairFailed'), why: url.searchParams.get('why')
+          });
+          if (armed && !handed) {
+            handed = true;
+            return response(200, { repairs: [{ conversationId: CHAT, token: 'committed-repair',
+              reason: 'silence', requiresClaim: true }] });
+          }
+          return response(200, { repairs: [] });
+        }
+        return response(200, {});
+      });
+      worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch,
+        tabsQuery: async () => [{ id: 21, url: `https://chatgpt.com/c/${CHAT}` }],
+        tabsGet: async () => ({ id: 21, url: `https://chatgpt.com/c/${CHAT}` }),
+        tabsSendMessage: options.pageReply ?? (async (_id, message) => message.type === 'clf-repair-check'
+          ? { safe: true, revision: 1, turnId: 'source', questionId: 'question' } : { ok: true }) });
+      return async () => {
+        await worker.registerTab(21);
+        await worker.send({ type: 'bind', conversationId: CHAT }, 21);
+        await worker.fireAlarm();
+        armed = true;
+        await worker.fireAlarm();
+      };
+    }
+
+    it('reports repaired after the page confirms its single reload dispatch', async () => {
+      const run = fixture();
+      await run();
+      expect(worker.tabsReload).toHaveBeenCalledExactlyOnceWith(21);
+      expect(worker.tabsCreate).not.toHaveBeenCalled();
+      expect(repaired).toEqual(['reloaded']);
+      expect(failures).toEqual([]);
+    });
+
+    it.each(['missing-reply', 'error-reply'] as const)(
+      'reports a spent commit as a non-deferred failure when dispatch is unknown: %s', async mode => {
+        const run = fixture();
+        if (mode === 'missing-reply') {
+          const send = worker.tabsSendMessage.getMockImplementation()!;
+          worker.tabsSendMessage.mockImplementation(async (...args: Parameters<typeof send>) => {
+            const result = await send(...args);
+            return args[1]?.type === 'clf-repair-commit' ? undefined : result;
+          });
+        } else {
+          worker.tabsReload.mockImplementationOnce(() => { throw new Error('reload failed'); });
+        }
+        await run();
+        expect(worker.tabsReload).toHaveBeenCalledExactlyOnceWith(21);
+        expect(worker.tabsCreate).not.toHaveBeenCalled();
+        expect(repaired).toEqual([]);
+        expect(failures).toHaveLength(1);
+        expect(failures[0]).toMatchObject({ token: 'committed-repair' });
+        expect(failures[0]!.why).not.toBe('deferred');
+      });
+
+    it('keeps a veto before the final commit deferred', async () => {
+      const run = fixture({ onClaim: async body => body.validate === true
+        ? response(200, { allowed: false, committed: false })
+        : response(200, { allowed: true, committed: true }) });
+      await run();
+      expect(worker.tabsReload).not.toHaveBeenCalled();
+      expect(repaired).toEqual([]);
+      expect(failures).toEqual([{ token: 'committed-repair', why: 'deferred' }]);
+    });
+
+    it.each(['draft', 'page-changed'] as const)(
+      'finishes a spent repair when its page cannot navigate after commit: %s', async change => {
+        let committed = false;
+        const run = fixture({
+          pageReply: async (_id, message) => message.type === 'clf-repair-check'
+            ? { safe: !committed, ...(committed ? { why: change } : {}), revision: 1, turnId: 'source', questionId: 'question' }
+            : { ok: true },
+          onClaim: async body => {
+            if (body.commit === true) committed = true;
+            return response(200, { allowed: true, committed: body.commit === true });
+          }
+        });
+        await run();
+        expect(committed).toBe(true);
+        expect(worker.tabsReload).not.toHaveBeenCalled();
+        expect(worker.tabsCreate).not.toHaveBeenCalled();
+        expect(repaired).toEqual([]);
+        expect(failures).toEqual([{ token: 'committed-repair', why: 'changed' }]);
+      });
+
+    it('reports failure after the fallback claim commits but the tab document changes', async () => {
+      const run = fixture({
+        pageReply: async (_id, message) => message.type === 'clf-repair-check' ? null : { ok: true },
+        onClaim: async body => {
+          if (body.validate === true && body.commit === true)
+            await worker.navigateTab(21, `https://chatgpt.com/c/${CHAT}`);
+          return response(200, { allowed: true, committed: true });
+        }
+      });
+      await run();
+      expect(worker.tabsReload).not.toHaveBeenCalled();
+      expect(worker.tabsCreate).not.toHaveBeenCalled();
+      expect(repaired).toEqual([]);
+      expect(failures).toHaveLength(1);
+      expect(failures[0]).toMatchObject({ token: 'committed-repair' });
+      expect(failures[0]!.why).not.toBe('deferred');
+    });
+  });
 
   it.each(['current', 'history-limit', 'stopped', 'page-progress'])('revalidates app authority after a pending repair probe: %s', async state => {
     let armed = false, handed = false, claimed = false, revoked = false, pageChanged = false;

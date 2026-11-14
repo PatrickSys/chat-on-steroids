@@ -9,6 +9,10 @@ The app and the browser extension in `extension/` are versioned together. **Relo
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.54] - Private carry
+
+Retain the private history, approval and recovery fixes; no public release.
+
 ## [2.1.53] — Compact & Resume in Projects, Goal chats that recover, and safer saves over SSH
 Compact & Resume now works in Projects where the app started chats, a Goal chat no longer stalls after a failed Continue, and saving a file over SSH can no longer lose the original. A message sent while ChatGPT answers goes out on pages in any language.
 

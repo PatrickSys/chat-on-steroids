@@ -700,12 +700,7 @@ function queueGoalReplyWrite(conversationId: string, change: () => Promise<void>
   goalReplyWrites.set(conversationId, tail);
   return write;
 }
-/** Freeze eligibility and its diagnostic together for one conversation. */
-export function acceptGoalReplyNow(input: Parameters<typeof acceptGoalReply>[0]): Promise<void> {
-  return queueGoalReplyWrite(input.conversationId, () => acceptGoalReply(input));
-}
-
-async function acceptGoalReply(input: {
+export async function acceptGoalReplyNow(input: {
   silenceSourceTurnId?: string;
   silencePro?: boolean;
   listenUntil?: number;
@@ -719,7 +714,10 @@ async function acceptGoalReply(input: {
   handledOnly?: true;
   current?: () => boolean;
 }): Promise<void> {
-  const finishOnly = !input.handledOnly && await astraFinishOnly(input.sessionId, input.conversationId);
+  let finishOnly = false;
+  await queueGoalReplyWrite(input.conversationId, async () => {
+    finishOnly = !input.handledOnly && await astraFinishOnly(input.sessionId, input.conversationId);
+  });
   if (input.silenceSourceTurnId &&
       !await turnHasMcpCall(input.sessionId, input.conversationId, input.silenceSourceTurnId)) return;
   const superseded = (): boolean => {
@@ -727,16 +725,16 @@ async function acceptGoalReply(input: {
     return latest?.replyId === input.replyId || (!!latest && latest.eventSeq > input.eventSeq);
   };
   if (superseded()) return;
-  // Async policy/diagnostic reads may yield to an objective save. The owner is
-  // checked again before publication, preserving the retired-turn fence.
-  const current = goalReplies.get(input.conversationId);
+  // Secret/history reads must not hold the write queue: a newer reply can
+  // become eligible while an older read is still pending.
+  const observed = goalReplies.get(input.conversationId);
   const armed =
     !input.handledOnly && !input.blocked &&
     getConfig().sessions.record &&
     goalArmedFor(input.conversationId) &&
     await goalKeyPresent(goalSwitchFor(input.conversationId).mode);
-  const explicitlyActive = current?.sessionId === input.sessionId && current.turnId === input.turnId &&
-    current.state === 'pending' && current.explicitActivation;
+  const explicitlyActive = observed?.sessionId === input.sessionId && observed.turnId === input.turnId &&
+    observed.state === 'pending' && observed.explicitActivation;
   const missingMcp = armed && !explicitlyActive && goalSwitchFor(input.conversationId).mode === 'loop' &&
     !await automaticLoopHasMcpWork(input.sessionId, input.conversationId, input.silenceSourceTurnId ?? input.turnId);
   let stalledTurn: string | undefined;
@@ -751,66 +749,73 @@ async function acceptGoalReply(input: {
       if (final && (final.messageId === input.replyId || input.replyId === 'turn:' + input.turnId)) stalledTurn = source;
     }
   }
-  if (input.current && !input.current()) return;
-  // A newer acceptance or objective save must win across the awaited policy/diagnostic reads.
-  if (superseded() || goalReplies.get(input.conversationId) !== current || finishOnly) return;
-  const provisionalUpgrade = Boolean(
-    current &&
-      current.eventSeq === 0 &&
-      current.turnId === input.turnId &&
-      current.replyId === `turn:${input.turnId}`.slice(0, 200)
-  );
-  // A genuine B reply carries the retired A turn's identity forward. A late
-  // observation of A may have a higher sequence, but must not replace B's debt.
-  const staleSource = (current?.staleObjective === true && current.turnId === input.turnId) ||
-    current?.staleTurnId === input.turnId;
-  if (staleSource) return;
-  const staleTurnId = current?.staleTurnId ?? (current?.staleObjective ? current.turnId : undefined);
-  const before = current ? { ...current } : null;
-  const bounded = snapshotGoalReplies().replies;
-  const active = armed && !missingMcp && goalArmedFor(input.conversationId);
-  const accepted: GoalReplyObligation = {
-    conversationId: input.conversationId,
-    sessionId: input.sessionId,
-    replyId: input.replyId.slice(0, 200),
-    turnId: input.turnId.slice(0, 200),
-    ...(staleTurnId ? { staleTurnId } : {}),
-    ...(provisionalUpgrade && current?.staleObjective ? { staleObjective: true } : {}),
-    ...(input.silenceSourceTurnId ? { silenceSourceTurnId: input.silenceSourceTurnId.slice(0, 200) } : {}),
-    ...(input.silencePro ? { silencePro: true } : {}),
-    ...(input.listenUntil ? { listenUntil: input.listenUntil } : {}),
-    ...(provisionalUpgrade && current?.pickupAttempts !== undefined ? { pickupAttempts: current.pickupAttempts } : {}),
-    ...(provisionalUpgrade && current?.pickupNextAt ? { pickupNextAt: current.pickupNextAt } : {}),
-    ...(provisionalUpgrade && current?.pickupStoppedAt ? { pickupStoppedAt: current.pickupStoppedAt } : {}),
-    eventSeq: input.eventSeq,
-    // `/goal/draft` may have had to persist the local turn before Fiber exposed ChatGPT's
-    // stable assistant id. The later id strengthens that same row; it must not re-evaluate
-    // policy or reopen a decision the page already acknowledged in the meantime.
-    acceptedAt: provisionalUpgrade ? current!.acceptedAt : Date.now(),
-    state: provisionalUpgrade ? current!.state : active ? 'pending' : 'handled'
-  };
-  goalReplies.set(input.conversationId, accepted);
-  const written = snapshotGoalReplies();
-  // Bounding the written revision may have retired rows; those, and only those, are this acceptance's to give back.
-  const keptRows = new Set(written.replies.map(row => row.conversationId));
-  const pruned = bounded.filter(row => row.conversationId !== input.conversationId && !keptRows.has(row.conversationId));
-  try {
-    await writeDurableNow(GOAL_REPLIES_STATE, written);
-  } catch (error) {
-    // The rejected write is one whole revision, so the rollback is too: the row this accept
-    // added and the expired rows it pruned go back together, leaving the ledger exactly as the
-    // decision found it.
-    // Only this chat's row goes back: clearing the whole ledger erased the replies other chats had
-    // accepted while this save was waiting (#2144). Rows this accept pruned are restored unless a
-    // newer row for that chat exists. A row somebody else removed meanwhile (a withdrawn silence reply) stays removed.
-    for (const reply of pruned) if (!goalReplies.has(reply.conversationId)) goalReplies.set(reply.conversationId, reply);
-    if (goalReplies.get(input.conversationId) === accepted) {
-      if (before) goalReplies.set(input.conversationId, before);
-      else goalReplies.delete(input.conversationId);
+  let published = false;
+  await queueGoalReplyWrite(input.conversationId, async () => {
+    if (input.current && !input.current()) return;
+    if (superseded() || finishOnly) return;
+    // Retirement and earlier publications may have replaced the row while
+    // eligibility was read. Carry their current fences into this publication.
+    const current = goalReplies.get(input.conversationId);
+    const provisionalUpgrade = Boolean(
+      current &&
+        current.eventSeq === 0 &&
+        current.turnId === input.turnId &&
+        current.replyId === `turn:${input.turnId}`.slice(0, 200)
+    );
+    // A genuine B reply carries the retired A turn's identity forward. A late
+    // observation of A may have a higher sequence, but must not replace B's debt.
+    const staleSource = (current?.staleObjective === true && current.turnId === input.turnId) ||
+      current?.staleTurnId === input.turnId;
+    if (staleSource) return;
+    const staleTurnId = current?.staleTurnId ?? (current?.staleObjective ? current.turnId : undefined);
+    const before = current ? { ...current } : null;
+    const bounded = snapshotGoalReplies().replies;
+    const active = armed && !missingMcp && goalArmedFor(input.conversationId);
+    const accepted: GoalReplyObligation = {
+      conversationId: input.conversationId,
+      sessionId: input.sessionId,
+      replyId: input.replyId.slice(0, 200),
+      turnId: input.turnId.slice(0, 200),
+      ...(staleTurnId ? { staleTurnId } : {}),
+      ...(provisionalUpgrade && current?.staleObjective ? { staleObjective: true } : {}),
+      ...(input.silenceSourceTurnId ? { silenceSourceTurnId: input.silenceSourceTurnId.slice(0, 200) } : {}),
+      ...(input.silencePro ? { silencePro: true } : {}),
+      ...(input.listenUntil ? { listenUntil: input.listenUntil } : {}),
+      ...(provisionalUpgrade && current?.pickupAttempts !== undefined ? { pickupAttempts: current.pickupAttempts } : {}),
+      ...(provisionalUpgrade && current?.pickupNextAt ? { pickupNextAt: current.pickupNextAt } : {}),
+      ...(provisionalUpgrade && current?.pickupStoppedAt ? { pickupStoppedAt: current.pickupStoppedAt } : {}),
+      eventSeq: input.eventSeq,
+      // `/goal/draft` may have had to persist the local turn before Fiber exposed ChatGPT's
+      // stable assistant id. The later id strengthens that same row; it must not re-evaluate
+      // policy or reopen a decision the page already acknowledged in the meantime.
+      acceptedAt: provisionalUpgrade ? current!.acceptedAt : Date.now(),
+      state: provisionalUpgrade ? current!.state : active ? 'pending' : 'handled'
+    };
+    goalReplies.set(input.conversationId, accepted);
+    const written = snapshotGoalReplies();
+    // Bounding the written revision may have retired rows; those, and only those, are this acceptance's to give back.
+    const keptRows = new Set(written.replies.map(row => row.conversationId));
+    const pruned = bounded.filter(row => row.conversationId !== input.conversationId && !keptRows.has(row.conversationId));
+    try {
+      await writeDurableNow(GOAL_REPLIES_STATE, written);
+    } catch (error) {
+      // The rejected write is one whole revision, so the rollback is too: the row this accept
+      // added and the expired rows it pruned go back together, leaving the ledger exactly as the
+      // decision found it.
+      // Only this chat's row goes back: clearing the whole ledger erased the replies other chats had
+      // accepted while this save was waiting (#2144). Rows this accept pruned are restored unless a
+      // newer row for that chat exists. A row somebody else removed meanwhile (a withdrawn silence reply) stays removed.
+      for (const reply of pruned) if (!goalReplies.has(reply.conversationId)) goalReplies.set(reply.conversationId, reply);
+      if (goalReplies.get(input.conversationId) === accepted) {
+        if (before) goalReplies.set(input.conversationId, before);
+        else goalReplies.delete(input.conversationId);
+      }
+      persistGoalRepliesSoon();
+      throw error;
     }
-    persistGoalRepliesSoon();
-    throw error;
-  }
+    published = true;
+  });
+  if (!published) return;
   // A Goal step that owes its reply is reviewed if the person asked for that (#1832); never awaited.
   if (goalReplies.get(input.conversationId)?.replyId === input.replyId.slice(0, 200) && goalReplies.get(input.conversationId)?.state === 'pending') {
     void (async () => {
